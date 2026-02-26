@@ -1,0 +1,1615 @@
+#!/usr/bin/env zsh
+# ============================================================
+#  m — terminal music CLI  (hardened build v2)
+#  All state lives in ~/music_system/
+#
+#  Structure:
+#    ~/music_system/
+#    ├── m                  ← this script (symlinked to /usr/local/bin/m)
+#    ├── config             ← optional overrides (sourced if present)
+#    ├── socket/            ← mpv IPC socket + mpv.pid
+#    ├── cache/             ← yt-dlp search caches (TTL configurable)
+#    ├── playlists/         ← saved .m3u playlists
+#    ├── txts/              ← .txt playlist files
+#    ├── downloads/         ← m dl output
+#    ├── data/
+#    │   ├── likes          ← liked tracks  (TSV: date\ttitle\turl)
+#    │   ├── history        ← play history  (TSV: date\ttitle\turl)
+#    │   └── txt_state      ← active txt playlist state
+#    └── locks/             ← lockfiles
+# ============================================================
+
+# ── paths ────────────────────────────────────────────────────
+MUSIC_ROOT="${MUSIC_ROOT:-$HOME/music_system}"
+SOCKET_DIR="$MUSIC_ROOT/socket"
+SOCKET="$SOCKET_DIR/mpv.sock"
+MPV_PID_FILE="$SOCKET_DIR/mpv.pid"
+CACHE_DIR="$MUSIC_ROOT/cache"
+PLAYLIST_DIR="$MUSIC_ROOT/playlists"
+TXTS_DIR="$MUSIC_ROOT/txts"
+DOWNLOADS_DIR="$MUSIC_ROOT/downloads"
+DATA_DIR="$MUSIC_ROOT/data"
+LOCK_DIR="$MUSIC_ROOT/locks"
+LOCK_FILE="$LOCK_DIR/start.lock"
+HISTORY_LOCK="$LOCK_DIR/history.lock"
+LIKES_FILE="$DATA_DIR/likes"
+HISTORY_FILE="$DATA_DIR/history"
+TXT_STATE_FILE="$DATA_DIR/txt_state"
+CONFIG_FILE="$MUSIC_ROOT/config"
+
+# ── defaults (overridable via config file) ────────────────────
+CACHE_TTL=3600          # seconds
+HISTORY_MAX=500         # lines
+DEFAULT_VOLUME=80       # 0–150
+VOLUME_STEP=5
+SEARCH_RESULTS=20       # fzf picker results
+AUDIO_DEVICE_SPEAKERS=""   # auto-detected or set in config
+AUDIO_DEVICE_HEADPHONES="" # auto-detected or set in config
+
+# ── load user config (safe source) ───────────────────────────
+# shellcheck disable=SC1090
+[ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
+
+# ── colours ──────────────────────────────────────────────────
+R=$'\e[0;31m'; G=$'\e[0;32m'; Y=$'\e[0;33m'
+C=$'\e[0;36m'; W=$'\e[1;37m'; M=$'\e[0;35m'; X=$'\e[0m'
+
+# ── OS detection ─────────────────────────────────────────────
+_os() {
+  case "$(uname -s)" in
+    Darwin) echo "mac" ;;
+    Linux)  echo "linux" ;;
+    *)      echo "unknown" ;;
+  esac
+}
+OS=$(_os)
+
+# ── cross-platform helpers ────────────────────────────────────
+
+# Portable md5 hash of stdin
+_md5() {
+  if [[ "$OS" == "mac" ]]; then
+    md5
+  else
+    md5sum | cut -c1-32
+  fi
+}
+
+# Portable file modification time (seconds since epoch)
+_mtime() {
+  local f="$1"
+  if [[ "$OS" == "mac" ]]; then
+    stat -f%m "$f" 2>/dev/null || echo 0
+  else
+    stat -c%Y "$f" 2>/dev/null || echo 0
+  fi
+}
+
+# Portable reverse cat (tac on Linux, tail -r on mac)
+_tac() {
+  if command -v tac &>/dev/null; then
+    tac "$@"
+  else
+    tail -r "$@"
+  fi
+}
+
+# Portable random line from file (replaces GNU shuf)
+_shuf1() {
+  local f="$1"
+  local n; n=$(wc -l < "$f" | tr -d ' ')
+  [ "$n" -eq 0 ] && return 1
+  local pick=$(( (RANDOM % n) + 1 ))
+  sed -n "${pick}p" "$f"
+}
+
+# Acquire a simple lockfile with timeout
+_lock() {
+  local lf="$1" timeout="${2:-5}"
+  local deadline=$(( $(date +%s) + timeout ))
+  while ! mkdir "$lf.d" 2>/dev/null; do
+    [[ $(date +%s) -gt $deadline ]] && return 1
+    sleep 0.05
+  done
+  echo $$ > "$lf"
+  return 0
+}
+_unlock() { local lf="$1"; rm -f "$lf"; rmdir "$lf.d" 2>/dev/null; }
+
+# ── binary resolution ─────────────────────────────────────────
+# Resolve each binary: config file > PATH > Homebrew prefix
+_resolve_bin() {
+  local name="$1"
+  # If already set (e.g. from config), verify it
+  local varname="${name:u}"   # uppercase: yt-dlp → YT-DLP (we handle below)
+  # Check PATH first
+  local found; found=$(command -v "$name" 2>/dev/null)
+  [ -n "$found" ] && { echo "$found"; return 0 }
+  # Homebrew fallbacks (both Apple Silicon and Intel)
+  for prefix in /opt/homebrew/bin /usr/local/bin /home/linuxbrew/.linuxbrew/bin; do
+    [ -x "$prefix/$name" ] && { echo "$prefix/$name"; return 0 }
+  done
+  echo ""
+  return 1
+}
+
+# Resolve all binaries at startup
+YTDLP="${YTDLP:-$(_resolve_bin yt-dlp)}"
+MPV="${MPV:-$(_resolve_bin mpv)}"
+FZF="${FZF:-$(_resolve_bin fzf)}"
+SOCAT="${SOCAT:-$(_resolve_bin socat)}"
+JQ="${JQ:-$(_resolve_bin jq)}"
+
+# ── bootstrap dirs ────────────────────────────────────────────
+_bootstrap() {
+  # Only run if something is missing — avoids touch-a on every invocation
+  if [[ ! -d "$DATA_DIR" || ! -f "$LIKES_FILE" || ! -f "$HISTORY_FILE" ]]; then
+    mkdir -p "$SOCKET_DIR" "$CACHE_DIR" "$PLAYLIST_DIR" \
+             "$TXTS_DIR" "$DOWNLOADS_DIR" "$DATA_DIR" "$LOCK_DIR"
+    [[ ! -f "$LIKES_FILE" ]]   && touch "$LIKES_FILE"
+    [[ ! -f "$HISTORY_FILE" ]] && touch "$HISTORY_FILE"
+    # Write a default config if none exists
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+      cat > "$CONFIG_FILE" <<'EOF'
+# m — user config  (uncomment + edit to override defaults)
+# CACHE_TTL=3600
+# HISTORY_MAX=500
+# DEFAULT_VOLUME=80
+# VOLUME_STEP=5
+# SEARCH_RESULTS=20
+# YTDLP=/usr/local/bin/yt-dlp
+# MPV=/usr/local/bin/mpv
+# AUDIO_DEVICE_SPEAKERS=coreaudio/BuiltInSpeakerDevice
+# AUDIO_DEVICE_HEADPHONES=coreaudio/BuiltInHeadphoneOutputDevice
+EOF
+    fi
+  else
+    # Ensure new dirs added in later versions also exist
+    mkdir -p "$DOWNLOADS_DIR" "$LOCK_DIR"
+  fi
+}
+_bootstrap
+
+# ── logging helpers ───────────────────────────────────────────
+_err()  { echo "${R}✖ $*${X}" >&2; exit 1 }
+_ok()   { echo "${G}✔ $*${X}" }
+_info() { echo "${C}→ $*${X}" }
+_warn() { echo "${Y}⚠ $*${X}" }
+
+# ── dependency check ──────────────────────────────────────────
+_check_deps() {
+  local missing=0
+  for bin in "$YTDLP" "$MPV" "$FZF" "$SOCAT" "$JQ"; do
+    if [[ -z "$bin" || ! -x "$bin" ]]; then
+      _warn "missing binary: ${bin:-<unresolved>}"
+      missing=1
+    fi
+  done
+  if [[ $missing -eq 1 ]]; then
+    _err "install missing deps:\n  macOS: brew install yt-dlp mpv fzf socat jq\n  Linux: sudo apt install mpv socat jq fzf && pip install yt-dlp"
+  fi
+}
+# Run at startup (not just on m start) so all commands fail cleanly
+_check_deps
+
+# ── audio device detection ────────────────────────────────────
+_detect_audio_devices() {
+  # Only needed on macOS; on Linux leave empty (use system default)
+  [[ "$OS" != "mac" ]] && return
+  if [[ -z "$AUDIO_DEVICE_SPEAKERS" ]]; then
+    AUDIO_DEVICE_SPEAKERS="coreaudio/BuiltInSpeakerDevice"
+  fi
+  if [[ -z "$AUDIO_DEVICE_HEADPHONES" ]]; then
+    AUDIO_DEVICE_HEADPHONES="coreaudio/BuiltInHeadphoneOutputDevice"
+  fi
+}
+_detect_audio_devices
+
+# ── daemon management ─────────────────────────────────────────
+_start() {
+  [ -S "$SOCKET" ] && return 0
+
+  # Lock to prevent concurrent start races
+  if [[ -f "$LOCK_FILE" ]]; then
+    local lock_age=$(( $(date +%s) - $(_mtime "$LOCK_FILE") ))
+    if [[ "$lock_age" -lt 10 ]]; then
+      _info "waiting for daemon..."
+      for i in $(seq 1 30); do
+        sleep 0.3
+        [ -S "$SOCKET" ] && return 0
+      done
+    fi
+    rm -f "$LOCK_FILE"
+  fi
+
+  touch "$LOCK_FILE"
+  _info "starting daemon..."
+
+  local device_flag=""
+  [[ -n "$AUDIO_DEVICE_SPEAKERS" ]] && device_flag="--audio-device=$AUDIO_DEVICE_SPEAKERS"
+
+  "$MPV" --no-video --idle=yes \
+    --input-ipc-server="$SOCKET" \
+    --script-opts=ytdl_hook-ytdl_path="$YTDLP" \
+    ${device_flag:+"$device_flag"} \
+    --volume="$DEFAULT_VOLUME" \
+    --quiet --really-quiet \
+    --ytdl-format="bestaudio/best" \
+    --cache=yes --cache-secs=60 \
+    --demuxer-max-bytes=50MiB \
+    --prefetch-playlist=yes \
+    --save-position-on-quit=no &
+  local mpv_pid=$!
+  disown $mpv_pid
+  echo $mpv_pid > "$MPV_PID_FILE"
+
+  for i in $(seq 1 30); do
+    sleep 0.3
+    if [ -S "$SOCKET" ]; then
+      rm -f "$LOCK_FILE"
+      return 0
+    fi
+  done
+
+  rm -f "$LOCK_FILE" "$MPV_PID_FILE"
+  _err "mpv daemon failed to start — check: $MPV --no-video --idle"
+}
+
+_need() {
+  [ -S "$SOCKET" ] || _err "daemon not running — run: m start"
+}
+
+# ── IPC helpers ───────────────────────────────────────────────
+_cmd() {
+  echo "$1" | "$SOCAT" - "$SOCKET" 2>/dev/null
+}
+
+_silent() {
+  echo "$1" | "$SOCAT" - "$SOCKET" >/dev/null 2>&1
+}
+
+_get() {
+  local raw
+  raw=$(_cmd "{\"command\":[\"get_property\",\"$1\"]}")
+  echo "$raw" | "$JQ" -r '.data // empty' 2>/dev/null
+}
+
+# Wait for a property to become non-empty
+_wait_prop() {
+  local prop="$1" max="${2:-25}" val
+  for i in $(seq 1 "$max"); do
+    val=$(_get "$prop")
+    [ -n "$val" ] && { echo "$val"; return 0 }
+    sleep 0.15
+  done
+  echo ""
+}
+
+# Safe IPC using jq to build JSON — prevents injection from titles/URLs
+# Usage: _ipc_cmd "command_name" "arg1" "arg2" ...
+_ipc_cmd() {
+  local cmd_json
+  # Build JSON array from arguments using jq — safe against special chars
+  cmd_json=$("$JQ" -cn --args '{"command":$ARGS.positional}' -- "$@")
+  _silent "$cmd_json"
+}
+
+# Safe loadfile — handles URLs/paths with quotes, spaces, special chars
+_ipc_loadfile() {
+  local url="$1" mode="${2:-append-play}"
+  local json
+  json=$("$JQ" -cn --arg url "$url" --arg mode "$mode" \
+    '{"command":["loadfile",$url,$mode]}')
+  _silent "$json"
+}
+
+# ── search & pick (with cache) ────────────────────────────────
+_cache_key() {
+  printf '%s' "$1" | _md5 | tr -d ' \n'
+}
+
+_cache_age() {
+  local f="$1"
+  [ -f "$f" ] || { echo 9999; return }
+  echo $(( $(date +%s) - $(_mtime "$f") ))
+}
+
+_pick() {
+  local query="$1"
+  local key="$CACHE_DIR/$(_cache_key "$query").cache"
+  local results
+
+  if [ -f "$key" ] && [ "$(_cache_age "$key")" -lt "$CACHE_TTL" ]; then
+    results=$(cat "$key")
+  else
+    _info "searching..."
+    results=$("$YTDLP" "ytsearch${SEARCH_RESULTS}:$query" \
+      --print "%(title)s | %(duration_string)s | %(webpage_url)s" \
+      --no-download --no-warnings 2>/dev/null)
+    [ -n "$results" ] && echo "$results" > "$key"
+  fi
+
+  [ -z "$results" ] && { _warn "no results for: $query"; return 1 }
+
+  echo "$results" | "$FZF" \
+    --height 55% --reverse \
+    --prompt "🎵 " \
+    --header "ENTER select · ESC cancel · cached if instant" \
+    --preview 'echo {} | sed "s/ | /\n/g"' \
+    --preview-window=down:3:wrap \
+    --ansi \
+  | awk -F ' \| ' '{print $NF}'
+}
+
+# ── history helpers ───────────────────────────────────────────
+_log_history() {
+  local title="$1" url="$2"
+  [ -z "$url" ] && return
+
+  # Atomic write with per-process lockfile
+  local tmpf; tmpf=$(mktemp "$HISTORY_FILE.XXXXXX")
+
+  if _lock "$HISTORY_LOCK" 3; then
+    printf '%s\t%s\t%s\n' "$(date '+%Y-%m-%d %H:%M')" "$title" "$url" >> "$HISTORY_FILE"
+    local lines; lines=$(wc -l < "$HISTORY_FILE" | tr -d ' ')
+    if [ "$lines" -gt "$HISTORY_MAX" ]; then
+      _tac "$HISTORY_FILE" | head -"$HISTORY_MAX" | _tac > "$tmpf" \
+        && mv "$tmpf" "$HISTORY_FILE" \
+        || rm -f "$tmpf"
+    else
+      rm -f "$tmpf"
+    fi
+    _unlock "$HISTORY_LOCK"
+  else
+    # Lock timed out — still append, skip trim this time
+    printf '%s\t%s\t%s\n' "$(date '+%Y-%m-%d %H:%M')" "$title" "$url" >> "$HISTORY_FILE"
+    rm -f "$tmpf"
+  fi
+}
+
+# ── extract clean YouTube URL ─────────────────────────────────
+_clean_url() {
+  local url="$1"
+  local vid
+
+  # Standard watch URL: v=VIDEOID
+  vid=$(printf '%s' "$url" | grep -oE '[?&]v=([A-Za-z0-9_-]{11})' | head -1 | cut -d= -f2)
+
+  # Short URL: youtu.be/VIDEOID (only the path segment after the last slash)
+  if [ -z "$vid" ]; then
+    vid=$(printf '%s' "$url" | grep -oE 'youtu\.be/([A-Za-z0-9_-]{11})' | head -1 \
+          | grep -oE '[A-Za-z0-9_-]{11}$')
+  fi
+
+  [ -n "$vid" ] && echo "https://www.youtube.com/watch?v=$vid" || echo "$url"
+}
+
+# ── local file detection ──────────────────────────────────────
+# Returns 0 if arg looks like a playable local file
+_is_local_file() {
+  local arg="$1"
+  # Absolute or relative path that exists, or starts with ./
+  [[ -f "$arg" || "$arg" == /* || "$arg" == ./* || "$arg" == ../* ]] && return 0
+  return 1
+}
+
+# ── subcommands ───────────────────────────────────────────────
+
+do_play() {
+  _start
+  _silent '{"command":["playlist-clear"]}'
+  local url
+
+  if _is_local_file "$1"; then
+    url="$1"
+    [[ -f "$url" ]] || _err "file not found: $url"
+    _info "loading local file..."
+  else
+    url=$(_pick "$1")
+  fi
+
+  [ -z "$url" ] && { _warn "cancelled"; return }
+  _info "buffering..."
+  _ipc_loadfile "$url" "append-play"
+  local title; title=$(_wait_prop media-title 30)
+  _ok "▶  ${title:-unknown}"
+  _log_history "${title:-unknown}" "$(_clean_url "$url")"
+}
+
+do_add() {
+  _start
+  local url
+
+  if _is_local_file "$1"; then
+    url="$1"
+    [[ -f "$url" ]] || _err "file not found: $url"
+  else
+    url=$(_pick "$1")
+  fi
+
+  [ -z "$url" ] && { _warn "cancelled"; return }
+  _ipc_loadfile "$url" "append-play"
+  _ok "➕ added to queue"
+}
+
+do_pause() {
+  _need
+  _silent '{"command":["cycle","pause"]}'
+  local p; p=$(_get pause)
+  [ "$p" = "true" ] && _info "⏸  paused" || _info "▶  resumed"
+}
+
+do_next() {
+  _need
+  _silent '{"command":["playlist-next"]}'
+  local title; title=$(_wait_prop media-title 20)
+  _ok "⏭  ${title:-end of queue}"
+}
+
+do_prev() {
+  _need
+  _silent '{"command":["playlist-prev"]}'
+  local title; title=$(_wait_prop media-title 20)
+  _ok "⏮  ${title:-beginning of queue}"
+}
+
+do_stop() {
+  # Use stored PID for precise targeting — no wild pkill patterns
+  if [[ -f "$MPV_PID_FILE" ]]; then
+    local pid; pid=$(cat "$MPV_PID_FILE" 2>/dev/null)
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null
+      # Wait up to 2s for graceful shutdown
+      for i in $(seq 1 20); do
+        sleep 0.1
+        kill -0 "$pid" 2>/dev/null || break
+      done
+      # Force if still alive
+      kill -9 "$pid" 2>/dev/null
+    fi
+    rm -f "$MPV_PID_FILE"
+  else
+    # Fallback: only kill mpv instances using OUR specific socket
+    pkill -f "input-ipc-server=${SOCKET}" 2>/dev/null
+  fi
+  rm -f "$SOCKET" "$LOCK_FILE"
+  _ok "stopped"
+}
+
+do_start() {
+  _start && _ok "daemon ready"
+}
+
+do_vol() {
+  _need
+  case "$1" in
+    +)
+      _silent '{"command":["add","volume",'"$VOLUME_STEP"']}'
+      # Clamp to 150
+      local v; v=$(_get volume | awk '{printf "%.0f",$1}')
+      if (( v > 150 )); then
+        _silent '{"command":["set_property","volume",150]}'
+      fi
+      ;;
+    -)
+      _silent '{"command":["add","volume",-'"$VOLUME_STEP"']}'
+      # Clamp to 0
+      local v; v=$(_get volume | awk '{printf "%.0f",$1}')
+      if (( v < 0 )); then
+        _silent '{"command":["set_property","volume",0]}'
+      fi
+      ;;
+    '')
+      # No argument → just print current volume
+      local v; v=$(_get volume)
+      _info "volume: $(echo "$v" | awk '{printf "%.0f%%",$1}')"
+      return
+      ;;
+    *)
+      [[ "$1" =~ ^[0-9]+$ ]] || _err "usage: m vol [0-150 | + | -]"
+      (( $1 > 150 )) && _err "max volume is 150"
+      _silent "{\"command\":[\"set_property\",\"volume\",$1]}"
+      ;;
+  esac
+  local v; v=$(_get volume)
+  _info "volume: $(echo "$v" | awk '{printf "%.0f%%",$1}')"
+}
+
+do_seek() {
+  _need
+  [ -z "$1" ] && _err "usage: m seek [+N | -N | N | MM:SS]"
+  local secs="$1"
+  # Convert MM:SS → seconds
+  if echo "$1" | grep -qE '^[+-]?[0-9]+:[0-9]{2}$'; then
+    local sign="" ts="$1"
+    [[ "$1" == +* ]] && { sign="+"; ts="${1#+}"; }
+    [[ "$1" == -* ]] && { sign="-"; ts="${1#-}"; }
+    local m s
+    m=$(echo "$ts" | cut -d: -f1)
+    s=$(echo "$ts" | cut -d: -f2)
+    secs="${sign}$(( m * 60 + s ))"
+  fi
+  # mpv seek accepts negative numbers directly for relative mode
+  case "$secs" in
+    +*) _silent "{\"command\":[\"seek\",\"${secs#+}\",\"relative\"]}" ;;
+    *)  _silent "{\"command\":[\"seek\",\"$secs\",\"$([ "${secs:0:1}" = "-" ] && echo relative || echo absolute)\"]}" ;;
+  esac
+  local pos; pos=$(_get time-pos)
+  local dur; dur=$(_get duration)
+  pos=$(echo "$pos" | awk '{printf "%d:%02d",$1/60,$1%60}' 2>/dev/null)
+  dur=$(echo "$dur" | awk '{printf "%d:%02d",$1/60,$1%60}' 2>/dev/null)
+  _info "⏩ ${pos} / ${dur}"
+}
+
+do_speed() {
+  _need
+  case "$1" in
+    # +/- use multiplicative steps (1.1/0.909) so they are true inverses:
+    # speed + then speed - returns exactly to original value.
+    +)  _silent '{"command":["multiply","speed",1.1]}' ;;
+    -)  _silent '{"command":["multiply","speed",0.909090909]}' ;;
+    r)  _silent '{"command":["set_property","speed",1.0]}'; _info "speed: 1.0x"; return ;;
+    '')  _err "usage: m speed [0.25-4.0 | + | - | r]" ;;
+    *)
+      [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]] || _err "usage: m speed [0.25-4.0 | + | - | r]"
+      (( $(echo "$1 < 0.25" | awk '{print ($1<0.25)?1:0}') )) && _err "min speed is 0.25"
+      (( $(echo "$1 > 4.0"  | awk '{print ($1>4.0)?1:0}') )) && _err "max speed is 4.0"
+      _silent "{\"command\":[\"set_property\",\"speed\",$1]}"
+      ;;
+  esac
+  local sp; sp=$(_get speed)
+  _info "speed: $(echo "$sp" | awk '{printf "%.3fx",$1}')"
+}
+
+do_hp() {
+  _need
+  [[ -z "$AUDIO_DEVICE_HEADPHONES" ]] && _err "headphone device not configured — set AUDIO_DEVICE_HEADPHONES in $CONFIG_FILE"
+  _silent "{\"command\":[\"set_property\",\"audio-device\",\"$AUDIO_DEVICE_HEADPHONES\"]}"
+  _ok "🎧 headphones"
+}
+
+do_sp() {
+  _need
+  [[ -z "$AUDIO_DEVICE_SPEAKERS" ]] && _err "speaker device not configured — set AUDIO_DEVICE_SPEAKERS in $CONFIG_FILE"
+  _silent "{\"command\":[\"set_property\",\"audio-device\",\"$AUDIO_DEVICE_SPEAKERS\"]}"
+  _ok "🔊 speakers"
+}
+
+do_shuffle() { _need; _silent '{"command":["playlist-shuffle"]}'; _ok "🔀 shuffled" }
+
+do_repeat() {
+  _need
+  _silent '{"command":["cycle","loop-playlist"]}'
+  local state; state=$(_get loop-playlist)
+  _info "🔁 repeat: ${state}"
+}
+
+do_repeat_one() {
+  _need
+  _silent '{"command":["cycle","loop-file"]}'
+  local state; state=$(_get loop-file)
+  _info "🔂 repeat-one: ${state}"
+}
+
+do_clear() { _need; _silent '{"command":["playlist-clear"]}'; _ok "🗑  queue cleared" }
+
+do_now() {
+  _need
+  local title pos dur paused speed
+  title=$(_get media-title)
+  [ -z "$title" ] && { _warn "nothing playing"; return }
+  pos=$(_get time-pos | awk '{printf "%d:%02d",$1/60,$1%60}' 2>/dev/null)
+  dur=$(_get duration   | awk '{printf "%d:%02d",$1/60,$1%60}' 2>/dev/null)
+  paused=$(_get pause)
+  speed=$(_get speed | awk '{printf "%.2f",$1}')
+  local icon="▶"; [ "$paused" = "true" ] && icon="⏸"
+  local pl_pos; pl_pos=$(_get playlist-playing-pos)
+  local pl_count; pl_count=$(_cmd '{"command":["get_property","playlist"]}' | "$JQ" '.data|length' 2>/dev/null)
+  echo ""
+  echo "  ${icon}  ${Y}${title}${X}"
+  echo "  ${W}${pos}${X} / ${W}${dur}${X}   speed: ${speed}x   queue: $((pl_pos+1))/${pl_count:-?}"
+  echo ""
+}
+
+do_bar() {
+  _need
+  local title; title=$(_get media-title)
+  [ -z "$title" ] && { _warn "nothing playing"; return }
+
+  tput civis
+  # Proper trap: restore cursor and move past display lines on any exit
+  local _bar_cleanup_done=0
+  _bar_cleanup() {
+    if [[ $_bar_cleanup_done -eq 0 ]]; then
+      _bar_cleanup_done=1
+      printf '\n\n\n'
+      tput cnorm
+    fi
+  }
+  trap '_bar_cleanup' INT TERM
+
+  local tw; tw=$(tput cols)
+  local bar_w=$(( tw - 22 ))
+  (( bar_w < 10 )) && bar_w=10
+
+  while true; do
+    local pos dur paused speed title2 repeat loop_one
+    pos=$(_get time-pos)
+    dur=$(_get duration)
+    paused=$(_get pause)
+    speed=$(_get speed | awk '{printf "%.2f",$1}')
+    title2=$(_get media-title)
+    repeat=$(_get loop-playlist)
+    loop_one=$(_get loop-file)
+
+    [ -z "$pos" ] || [ -z "$dur" ] && break
+
+    local pos_i dur_i
+    pos_i=$(printf '%.0f' "$pos" 2>/dev/null || echo 0)
+    dur_i=$(printf '%.0f' "$dur" 2>/dev/null || echo 1)
+    (( dur_i < 1 )) && dur_i=1
+
+    local pct=$(( pos_i * 100 / dur_i ))
+    local filled=$(( pos_i * bar_w / dur_i ))
+    local empty=$(( bar_w - filled ))
+    (( filled < 0 )) && filled=0
+    (( empty  < 0 )) && empty=0
+
+    local pos_fmt; pos_fmt=$(awk "BEGIN{printf \"%d:%02d\", $pos_i/60, $pos_i%60}")
+    local dur_fmt; dur_fmt=$(awk "BEGIN{printf \"%d:%02d\", $dur_i/60, $dur_i%60}")
+    local rem_i=$(( dur_i - pos_i ))
+    local rem_fmt; rem_fmt=$(awk "BEGIN{printf \"-%d:%02d\", $rem_i/60, $rem_i%60}")
+
+    local icon="▶"; [ "$paused" = "true" ] && icon="⏸"
+    local rep_icon=""
+    [[ "$loop_one" != "no" && -n "$loop_one" ]] && rep_icon=" 🔂"
+    [[ "$repeat"   != "no" && -n "$repeat"   ]] && rep_icon=" 🔁"
+
+    local bar_filled bar_empty
+    bar_filled=$(printf '%*s' "$filled" '' | tr ' ' '━')
+    bar_empty=$(printf '%*s'  "$empty"  '' | tr ' ' '─')
+
+    printf '\r\e[2K'
+    printf "\e[0;36m  ${icon}  \e[1;37m%.${tw}s\e[0m" "${title2}${rep_icon}"
+    printf '\n\r\e[2K'
+    printf "  \e[0;36m%s\e[0m\e[2m%s\e[0m  \e[0;33m%s\e[0m / \e[0;37m%s\e[0m  \e[2m(%s)\e[0m" \
+      "$bar_filled" "$bar_empty" "$pos_fmt" "$dur_fmt" "$rem_fmt"
+    printf '\n\r\e[2K'
+    printf "  \e[2mspeed: %sx  %d%%  p=pause  n/b=skip  ,/.=seek  +/-=vol  r=repeat  q=quit\e[0m" "$speed" "$pct"
+    printf '\e[2A'
+
+    local key
+    if read -r -s -k1 -t 0.5 key 2>/dev/null; then
+      case "$key" in
+        q|Q|$'\e') break ;;
+        p) _silent '{"command":["cycle","pause"]}' ;;
+        n) _silent '{"command":["playlist-next"]}'; sleep 0.4 ;;
+        b) _silent '{"command":["playlist-prev"]}'; sleep 0.4 ;;
+        .) _silent '{"command":["seek","10","relative"]}' ;;
+        ,) _silent '{"command":["seek","-10","relative"]}' ;;
+        +) _silent '{"command":["add","volume",'"$VOLUME_STEP"']}' ;;
+        -) _silent '{"command":["add","volume",-'"$VOLUME_STEP"']}' ;;
+        r) _silent '{"command":["cycle","loop-playlist"]}' ;;
+        1) _silent '{"command":["cycle","loop-file"]}' ;;
+      esac
+    fi
+  done
+
+  _bar_cleanup
+  trap - INT TERM
+}
+
+do_scrub() {
+  _need
+  local title pos dur
+  title=$(_get media-title)
+  [ -z "$title" ] && { _warn "nothing playing"; return }
+  dur=$(_get duration)
+  pos=$(_get time-pos)
+  [ -z "$dur" ] && { _warn "duration unavailable (still buffering?)"; return }
+
+  local dur_i; dur_i=$(printf '%.0f' "$dur")
+  local pos_i; pos_i=$(printf '%.0f' "${pos:-0}")
+  (( dur_i < 1 )) && { _warn "track too short to scrub"; return }
+
+  local step=5
+  (( dur_i / step > 500 )) && step=$(( dur_i / 500 + 1 ))
+
+  local lines=()
+  local t=0
+  while (( t <= dur_i )); do
+    local mm ss pct bar_fill bar_empty filled_w empty_w
+    mm=$(( t / 60 )); ss=$(( t % 60 ))
+    pct=$(( t * 100 / dur_i ))
+    filled_w=$(( pct * 30 / 100 ))
+    empty_w=$(( 30 - filled_w ))
+    bar_fill=$(printf '%*s' "$filled_w" '' | tr ' ' '█')
+    bar_empty=$(printf '%*s' "$empty_w" '' | tr ' ' '░')
+    local marker="  "
+    (( t >= pos_i - step/2 && t <= pos_i + step/2 )) && marker="▶ "
+    lines+=("$(printf '%s%02d:%02d  [%s%s]  %3d%%' "$marker" "$mm" "$ss" "$bar_fill" "$bar_empty" "$pct")")
+    t=$(( t + step ))
+  done
+
+  local chosen
+  chosen=$(printf '%s\n' "${lines[@]}" | "$FZF" \
+    --height 70% --reverse \
+    --prompt "⏱  scrub > " \
+    --header "▶ marks current pos · ENTER to jump · ESC cancel" \
+    --no-sort)
+
+  [ -z "$chosen" ] && { _warn "cancelled"; return }
+
+  local ts; ts=$(echo "$chosen" | grep -oE '[0-9]+:[0-9]{2}' | head -1)
+  [ -z "$ts" ] && _err "could not parse timestamp"
+
+  local m s target_secs
+  m=$(echo "$ts" | cut -d: -f1 | sed 's/^0*//' ); m=${m:-0}
+  s=$(echo "$ts" | cut -d: -f2 | sed 's/^0*//' ); s=${s:-0}
+  target_secs=$(( m * 60 + s ))
+
+  _silent "{\"command\":[\"seek\",\"$target_secs\",\"absolute\"]}"
+  sleep 0.1
+  local new_pos; new_pos=$(_get time-pos | awk '{printf "%d:%02d",$1/60,$1%60}')
+  _ok "jumped to ${new_pos}  /  $(awk "BEGIN{printf \"%d:%02d\",$dur_i/60,$dur_i%60}")"
+}
+
+do_queue() {
+  _need
+  local pl current_idx n
+  pl=$(_cmd '{"command":["get_property","playlist"]}')
+  n=$(echo "$pl" | "$JQ" '.data|length' 2>/dev/null)
+  # playlist-playing-pos is 0-based position, NOT the .id field
+  current_idx=$(_get playlist-playing-pos)
+  [ -z "$n" ] || [ "$n" = "0" ] && { _warn "queue empty"; return }
+  echo ""
+  echo "  ${C}queue — ${n} tracks${X}"
+  echo ""
+  # Use array index (0-based) for current-track comparison, not .id
+  echo "$pl" | "$JQ" -r '.data | to_entries[] | [(.key|tostring), (.value.title // .value.filename)] | @tsv' 2>/dev/null \
+    | while IFS=$'\t' read -r idx title; do
+        if [ "$idx" = "$current_idx" ]; then
+          echo "  ${G}▶ $((idx+1)). ${title}${X}"
+        else
+          echo "    $((idx+1)). ${title}"
+        fi
+      done
+  echo ""
+}
+
+do_queue_move() {
+  # Move a track in the queue: m qmove <from> <to>  (1-based)
+  _need
+  [[ -z "$1" || -z "$2" ]] && _err "usage: m qmove <from_pos> <to_pos>  (1-based)"
+  local from=$(( $1 - 1 )) to=$(( $2 - 1 ))
+  _silent "{\"command\":[\"playlist-move\",${from},${to}]}"
+  _ok "moved track $1 → position $2"
+}
+
+do_queue_remove() {
+  # Remove a track by position: m qrm <pos>  (1-based)
+  _need
+  [[ -z "$1" ]] && _err "usage: m qrm <pos>  (1-based)"
+  local pos=$(( $1 - 1 ))
+  _silent "{\"command\":[\"playlist-remove\",${pos}]}"
+  _ok "removed track $1 from queue"
+}
+
+do_status() {
+  if [ ! -S "$SOCKET" ]; then
+    echo ""
+    echo "  ${R}● stopped${X}   run: m start"
+    echo ""
+    return
+  fi
+  local title paused vol speed
+  title=$(_get media-title)
+  paused=$(_get pause)
+  vol=$(_get volume | awk '{printf "%.0f",$1}')
+  speed=$(_get speed | awk '{printf "%.2f",$1}')
+  local pl_count; pl_count=$(_cmd '{"command":["get_property","playlist"]}' | "$JQ" '.data|length' 2>/dev/null)
+  local repeat; repeat=$(_get loop-playlist)
+  local loop_one; loop_one=$(_get loop-file)
+  echo ""
+  printf "  ${G}● running${X}   vol:%s%%   speed:%sx   queue:%s tracks\n" "$vol" "$speed" "${pl_count:-0}"
+  # Active txt playlist
+  _txt_state_read
+  if [ -n "$TXT_ACTIVE_FILE" ]; then
+    _txt_read_lines "$TXT_ACTIVE_FILE"
+    printf "  ${C}txt:${X} %s  [%s/%s]\n" "$(basename "$TXT_ACTIVE_FILE" .txt)" \
+      "$(( TXT_ACTIVE_IDX + 1 ))" "${#TXT_LINES[@]}"
+  fi
+  [[ "$repeat"   != "no" && -n "$repeat"   ]] && printf "  ${Y}🔁 repeat-playlist on${X}\n"
+  [[ "$loop_one" != "no" && -n "$loop_one" ]] && printf "  ${Y}🔂 repeat-one on${X}\n"
+  if [ -n "$title" ]; then
+    local pos dur
+    pos=$(_get time-pos | awk '{printf "%d:%02d",$1/60,$1%60}' 2>/dev/null)
+    dur=$(_get duration   | awk '{printf "%d:%02d",$1/60,$1%60}' 2>/dev/null)
+    [ "$paused" = "true" ] \
+      && echo "  ${Y}⏸  ${title}${X}   ${pos}/${dur}" \
+      || echo "  ${G}▶  ${title}${X}   ${pos}/${dur}"
+  else
+    echo "  ${W}idle — queue something with: m \"song name\"${X}"
+  fi
+  echo ""
+}
+
+# ── like / love ───────────────────────────────────────────────
+
+do_like() {
+  _need
+  local title url clean
+  title=$(_get media-title)
+  url=$(_get path)
+  [ -z "$url" ] && { _warn "nothing playing"; return }
+  clean=$(_clean_url "$url")
+  if grep -qF "$clean" "$LIKES_FILE" 2>/dev/null; then
+    _warn "already liked: $title"
+    return
+  fi
+  # Safe printf: title may contain quotes/special chars
+  printf '%s\t%s\t%s\n' "$(date '+%Y-%m-%d %H:%M')" "$title" "$clean" >> "$LIKES_FILE"
+  _ok "❤  liked: ${title}"
+}
+
+do_unlike() {
+  [ -s "$LIKES_FILE" ] || { _warn "no likes yet"; return }
+  local line
+  line=$("$FZF" \
+    --height 50% --reverse \
+    --prompt "💔 unlike > " \
+    --header "ENTER to remove · ESC cancel" \
+    --with-nth=2 --delimiter=$'\t' < "$LIKES_FILE")
+  [ -z "$line" ] && { _warn "cancelled"; return }
+  local tmpf; tmpf=$(mktemp "$LIKES_FILE.XXXXXX")
+  grep -vF "$line" "$LIKES_FILE" > "$tmpf" && mv "$tmpf" "$LIKES_FILE" || rm -f "$tmpf"
+  _ok "removed from likes"
+}
+
+do_likes() {
+  [ -s "$LIKES_FILE" ] || { _warn "no likes yet — use: m like"; return }
+  echo ""
+  echo "  ${M}❤  liked tracks${X}"
+  echo ""
+  awk -F'\t' '{print NR". "$2}' "$LIKES_FILE" | sed 's/^/  /'
+  echo ""
+}
+
+do_love() {
+  _need
+  [ -s "$LIKES_FILE" ] || { _warn "no likes yet — use: m like while playing"; return }
+  local line; line=$(_shuf1 "$LIKES_FILE")
+  [ -z "$line" ] && { _warn "likes file empty"; return }
+  local url title
+  url=$(printf '%s' "$line" | awk -F'\t' '{print $3}')
+  title=$(printf '%s' "$line" | awk -F'\t' '{print $2}')
+  _start
+  _silent '{"command":["playlist-clear"]}'
+  _ipc_loadfile "$url" "append-play"
+  local actual_title; actual_title=$(_wait_prop media-title 30)
+  _ok "❤  ▶  ${actual_title:-$title}"
+}
+
+do_likes_play() {
+  _need
+  [ -s "$LIKES_FILE" ] || { _warn "no likes yet"; return }
+  local line
+  line=$("$FZF" \
+    --height 50% --reverse \
+    --prompt "❤ play liked > " \
+    --header "ENTER play · ESC cancel" \
+    --with-nth=2 --delimiter=$'\t' < "$LIKES_FILE")
+  [ -z "$line" ] && { _warn "cancelled"; return }
+  local url; url=$(printf '%s' "$line" | awk -F'\t' '{print $3}')
+  _silent '{"command":["playlist-clear"]}'
+  _ipc_loadfile "$url" "append-play"
+  local actual_title; actual_title=$(_wait_prop media-title 30)
+  _ok "▶  ${actual_title:-playing}"
+}
+
+# ── history ───────────────────────────────────────────────────
+
+do_history() {
+  [ -s "$HISTORY_FILE" ] || { _warn "no history yet"; return }
+  local line url
+  line=$(_tac "$HISTORY_FILE" | "$FZF" \
+    --height 60% --reverse \
+    --prompt "🕑 history > " \
+    --header "ENTER replay · ESC cancel" \
+    --with-nth=1,2 --delimiter=$'\t' \
+    --preview 'printf "Date:  %s\nTitle: %s\nURL:   %s\n" $(echo {} | cut -f1) $(echo {} | cut -f2) $(echo {} | cut -f3)' \
+    --preview-window=down:3:wrap)
+  [ -z "$line" ] && { _warn "cancelled"; return }
+  url=$(printf '%s' "$line" | awk -F'\t' '{print $3}')
+  [ -z "$url" ] && _err "could not extract URL from history entry"
+  _start
+  _silent '{"command":["playlist-clear"]}'
+  _ipc_loadfile "$url" "append-play"
+  local title; title=$(_wait_prop media-title 30)
+  _ok "▶  ${title:-playing}"
+}
+
+do_history_clear() {
+  printf "${Y}Clear all history? [y/N] ${X}"
+  read -r ans
+  [[ "$ans" =~ ^[Yy]$ ]] || { _warn "cancelled"; return }
+  > "$HISTORY_FILE"
+  _ok "history cleared"
+}
+
+# ── playlists ─────────────────────────────────────────────────
+
+do_save() {
+  _need
+  [ -z "$1" ] && _err "usage: m save <name>"
+  local name="$1"
+  name=$(printf '%s' "$name" | tr ' ' '_' | tr -cd '[:alnum:]_-')
+  [ -z "$name" ] && _err "invalid playlist name"
+  local file="$PLAYLIST_DIR/${name}.m3u"
+  local tmpf; tmpf=$(mktemp "$PLAYLIST_DIR/${name}.XXXXXX")
+  local count=0
+  while IFS= read -r url; do
+    [ -z "$url" ] && continue
+    printf '%s\n' "$(_clean_url "$url")" >> "$tmpf"
+    count=$(( count + 1 ))
+  done < <(_cmd '{"command":["get_property","playlist"]}' | "$JQ" -r '.data[].filename' 2>/dev/null)
+  if [[ $count -eq 0 ]]; then
+    rm -f "$tmpf"
+    _err "queue is empty — nothing to save"
+  fi
+  mv "$tmpf" "$file"
+  _ok "saved: ${name}  (${count} tracks)"
+}
+
+do_load() {
+  [ -z "$1" ] && _err "usage: m load <name>"
+  local f="$PLAYLIST_DIR/${1}.m3u"
+  [ -f "$f" ] || _err "playlist not found: $1"
+  _start
+  _silent '{"command":["playlist-clear"]}'
+  local count=0
+  while IFS= read -r line; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    _ipc_loadfile "$line" "append-play"
+    count=$(( count + 1 ))
+  done < "$f"
+  _ok "loaded: $1  (${count} tracks)"
+  _info "first track buffering... use: m now"
+}
+
+do_playlists() {
+  echo ""
+  echo "  ${C}saved playlists:${X}"
+  local found=0
+  for f in "$PLAYLIST_DIR"/*.m3u(N); do
+    local name; name=$(basename "$f" .m3u)
+    # Count only non-blank, non-comment lines
+    local count; count=$(grep -cvE '^\s*(#|$)' "$f" 2>/dev/null || echo 0)
+    echo "  ∙ ${W}${name}${X}  (${count} tracks)"
+    found=1
+  done
+  [ $found -eq 0 ] && echo "  (none yet — use: m save <name>)"
+  echo ""
+}
+
+do_playlist_del() {
+  [ -z "$1" ] && _err "usage: m pldel <name>"
+  local f="$PLAYLIST_DIR/${1}.m3u"
+  [ -f "$f" ] || _err "not found: $1"
+  printf "${Y}Delete playlist '%s'? [y/N] ${X}" "$1"
+  read -r ans
+  [[ "$ans" =~ ^[Yy]$ ]] || { _warn "cancelled"; return }
+  rm "$f"
+  _ok "deleted playlist: $1"
+}
+
+# ── download ──────────────────────────────────────────────────
+
+do_dl() {
+  [ -z "$1" ] && _err "usage: m dl \"song query\""
+  _info "searching to download..."
+  local url; url=$(_pick "$1")
+  [ -z "$url" ] && { _warn "cancelled"; return }
+  _info "downloading to $DOWNLOADS_DIR ..."
+  "$YTDLP" "$url" \
+    --extract-audio \
+    --audio-format mp3 \
+    --audio-quality 0 \
+    --output "$DOWNLOADS_DIR/%(title)s.%(ext)s" \
+    --no-playlist
+  _ok "download complete → $DOWNLOADS_DIR"
+}
+
+do_dl_list() {
+  echo ""
+  echo "  ${C}downloads:${X}  $DOWNLOADS_DIR"
+  echo ""
+  for f in "$DOWNLOADS_DIR"/*.mp3(N) "$DOWNLOADS_DIR"/*.m4a(N) "$DOWNLOADS_DIR"/*.opus(N); do
+    echo "  ∙ $(basename "$f")"
+  done
+  echo ""
+}
+
+# ── import YouTube playlist ───────────────────────────────────
+
+do_import() {
+  [ -z "$1" ] && _err "usage: m import \"https://youtube.com/playlist?list=...\""
+  _info "fetching playlist metadata (this may take a moment)..."
+  local tmpf; tmpf=$(mktemp "$PLAYLIST_DIR/import.XXXXXX")
+  "$YTDLP" "$1" \
+    --flat-playlist \
+    --print "%(webpage_url)s" \
+    --no-warnings 2>/dev/null > "$tmpf"
+  local count; count=$(wc -l < "$tmpf" | tr -d ' ')
+  if [[ $count -eq 0 ]]; then
+    rm -f "$tmpf"
+    _err "no tracks found — is the URL correct and the playlist public?"
+  fi
+  # Ask for a save name
+  printf "${C}Save as playlist name: ${X}"
+  read -r pname
+  pname=$(printf '%s' "$pname" | tr ' ' '_' | tr -cd '[:alnum:]_-')
+  [ -z "$pname" ] && { rm -f "$tmpf"; _err "invalid name"; }
+  mv "$tmpf" "$PLAYLIST_DIR/${pname}.m3u"
+  _ok "imported: ${pname}  (${count} tracks)  →  m load ${pname}"
+}
+
+# ── txt playlist system ───────────────────────────────────────
+
+_txt_state_write() {
+  local file="$1" idx="$2"
+  printf '%s\t%s\n' "$file" "$idx" > "$TXT_STATE_FILE"
+}
+
+_txt_state_read() {
+  TXT_ACTIVE_FILE=""
+  TXT_ACTIVE_IDX=0
+  [ -f "$TXT_STATE_FILE" ] || return
+  TXT_ACTIVE_FILE=$(awk -F'\t' '{print $1}' "$TXT_STATE_FILE")
+  TXT_ACTIVE_IDX=$(awk -F'\t' '{print $2}' "$TXT_STATE_FILE")
+  [ -f "$TXT_ACTIVE_FILE" ] || { TXT_ACTIVE_FILE=""; TXT_ACTIVE_IDX=0; }
+}
+
+_txt_read_lines() {
+  local f="$1"
+  TXT_LINES=()
+  while IFS= read -r line; do
+    line="${line#"${line%%[! ]*}"}"
+    line="${line%"${line##*[! ]}"}"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    TXT_LINES+=("$line")
+  done < "$f"
+}
+
+_txt_resolve() {
+  local arg="$1"
+  [ -f "$arg" ] && { echo "$arg"; return }
+  [ -f "$TXTS_DIR/${arg}.txt" ] && { echo "$TXTS_DIR/${arg}.txt"; return }
+  [ -f "$TXTS_DIR/${arg}" ] && { echo "$TXTS_DIR/${arg}"; return }
+  echo ""
+}
+
+_txt_search_and_play_line() {
+  local query="$1"
+  local key="$CACHE_DIR/$(_cache_key "$query").cache"
+  local results url
+
+  if [ -f "$key" ] && [ "$(_cache_age "$key")" -lt "$CACHE_TTL" ]; then
+    results=$(cat "$key")
+  else
+    results=$("$YTDLP" "ytsearch5:$query" \
+      --print "%(title)s | %(duration_string)s | %(webpage_url)s" \
+      --no-download --no-warnings 2>/dev/null)
+    [ -n "$results" ] && echo "$results" > "$key"
+  fi
+
+  [ -z "$results" ] && return 1
+  url=$(echo "$results" | head -1 | awk -F ' \| ' '{print $NF}')
+  echo "$url"
+}
+
+_txt_kill_bg_job() {
+  local bg_pid_file="$DATA_DIR/txt_bg_pid"
+  if [ -f "$bg_pid_file" ]; then
+    local old_pid; old_pid=$(cat "$bg_pid_file" 2>/dev/null)
+    if [ -n "$old_pid" ]; then
+      # Try process group kill first, then individual PID
+      kill -TERM -- "-$old_pid" 2>/dev/null || kill -TERM "$old_pid" 2>/dev/null
+      # Brief wait, then SIGKILL if still alive
+      sleep 0.2
+      kill -0 "$old_pid" 2>/dev/null && kill -KILL "$old_pid" 2>/dev/null
+    fi
+    rm -f "$bg_pid_file"
+  fi
+}
+
+do_txt() {
+  local arg="$1"
+  local chosen_file=""
+
+  if [ -z "$arg" ]; then
+    local files=("$TXTS_DIR"/*.txt(N))
+    if [ ${#files[@]} -eq 0 ]; then
+      _warn "no .txt files in $TXTS_DIR"
+      _info "create one and drop it there — one song name per line"
+      return
+    fi
+    local display=()
+    for f in "${files[@]}"; do
+      local n; n=$(grep -cvE '^\s*(#|$)' "$f" 2>/dev/null || echo 0)
+      display+=("$(basename "$f" .txt)  ${W}(${n} songs)${X}")
+    done
+    local picked
+    picked=$(printf '%s\n' "${display[@]}" | "$FZF" \
+      --height 50% --reverse \
+      --prompt "📄 txt playlist > " \
+      --header "ENTER to load · ESC cancel" \
+      --ansi)
+    [ -z "$picked" ] && { _warn "cancelled"; return }
+    local fname; fname=$(echo "$picked" | awk '{print $1}')
+    chosen_file="$TXTS_DIR/${fname}.txt"
+  else
+    chosen_file=$(_txt_resolve "$arg")
+    [ -z "$chosen_file" ] && _err "txt file not found: $arg  (looked in $TXTS_DIR)"
+  fi
+
+  _txt_read_lines "$chosen_file"
+  [ ${#TXT_LINES[@]} -eq 0 ] && _err "txt file is empty or has only comments: $chosen_file"
+
+  _start
+
+  local fname_display; fname_display=$(basename "$chosen_file" .txt)
+  _info "loading txt playlist: ${fname_display}  (${#TXT_LINES[@]} songs)"
+
+  # Kill any previous background queuing job before starting a new one
+  _txt_kill_bg_job
+
+  local bg_pid_file="$DATA_DIR/txt_bg_pid"
+
+  _txt_state_write "$chosen_file" 0
+
+  _silent '{"command":["playlist-clear"]}'
+
+  local first_url
+  first_url=$(_txt_search_and_play_line "${TXT_LINES[1]}")
+  if [ -z "$first_url" ]; then
+    _warn "could not find: ${TXT_LINES[1]} — skipping"
+  else
+    _ipc_loadfile "$first_url" "replace"
+  fi
+
+  # Queue remaining songs in background
+  (
+    local i=2
+    while [ $i -le ${#TXT_LINES[@]} ]; do
+      # Exit if bg_pid_file was removed (signal from txtnext/txtprev)
+      [ -f "$bg_pid_file" ] || exit 0
+      local url
+      url=$(_txt_search_and_play_line "${TXT_LINES[$i]}")
+      if [ -n "$url" ]; then
+        local json
+        json=$("$JQ" -cn --arg url "$url" '{"command":["loadfile",$url,"append"]}')
+        echo "$json" | "$SOCAT" - "$SOCKET" >/dev/null 2>&1
+      fi
+      i=$(( i + 1 ))
+    done
+    rm -f "$bg_pid_file"
+  ) &
+  local bg_pid=$!
+  echo $bg_pid > "$bg_pid_file"
+  disown $bg_pid
+
+  local title; title=$(_wait_prop media-title 30)
+  _ok "▶  ${title:-${TXT_LINES[1]}}"
+  _info "use: m txtnext (tn) / m txtprev (tp) to step through"
+}
+
+do_txtnext() {
+  _need
+  _txt_state_read
+  [ -z "$TXT_ACTIVE_FILE" ] && _err "no active txt playlist — start one with: m txt"
+
+  _txt_read_lines "$TXT_ACTIVE_FILE"
+  local total=${#TXT_LINES[@]}
+  local next_idx=$(( TXT_ACTIVE_IDX + 1 ))
+
+  if [ $next_idx -ge $total ]; then
+    _warn "end of txt playlist: $(basename "$TXT_ACTIVE_FILE" .txt)  ($total songs)"
+    return
+  fi
+
+  _txt_kill_bg_job
+  _txt_state_write "$TXT_ACTIVE_FILE" "$next_idx"
+  local query="${TXT_LINES[$(( next_idx + 1 ))]}"
+  _info "searching: ${query}"
+
+  local url; url=$(_txt_search_and_play_line "$query")
+  [ -z "$url" ] && { _warn "could not find: $query"; return }
+
+  _silent '{"command":["playlist-clear"]}'
+  _ipc_loadfile "$url" "replace"
+  local title; title=$(_wait_prop media-title 20)
+  _ok "⏭  [$(( next_idx + 1 ))/${total}]  ${title:-$query}"
+}
+
+do_txtprev() {
+  _need
+  _txt_state_read
+  [ -z "$TXT_ACTIVE_FILE" ] && _err "no active txt playlist — start one with: m txt"
+
+  _txt_read_lines "$TXT_ACTIVE_FILE"
+  local total=${#TXT_LINES[@]}
+  local prev_idx=$(( TXT_ACTIVE_IDX - 1 ))
+
+  if [ $prev_idx -lt 0 ]; then
+    _warn "already at start of txt playlist: $(basename "$TXT_ACTIVE_FILE" .txt)"
+    return
+  fi
+
+  _txt_kill_bg_job
+  _txt_state_write "$TXT_ACTIVE_FILE" "$prev_idx"
+  local query="${TXT_LINES[$(( prev_idx + 1 ))]}"
+  _info "searching: ${query}"
+
+  local url; url=$(_txt_search_and_play_line "$query")
+  [ -z "$url" ] && { _warn "could not find: $query"; return }
+
+  _silent '{"command":["playlist-clear"]}'
+  _ipc_loadfile "$url" "replace"
+  local title; title=$(_wait_prop media-title 20)
+  _ok "⏮  [$(( prev_idx + 1 ))/${total}]  ${title:-$query}"
+}
+
+do_txtnow() {
+  _txt_state_read
+  if [ -z "$TXT_ACTIVE_FILE" ]; then
+    _warn "no active txt playlist"
+    _info "start one with: m txt"
+    return
+  fi
+  _txt_read_lines "$TXT_ACTIVE_FILE"
+  local total=${#TXT_LINES[@]}
+  local current_query="${TXT_LINES[$(( TXT_ACTIVE_IDX + 1 ))]}"
+  echo ""
+  echo "  ${C}txt playlist:${X}  $(basename "$TXT_ACTIVE_FILE" .txt)"
+  echo "  ${W}position:${X}    $(( TXT_ACTIVE_IDX + 1 )) / ${total}"
+  echo "  ${W}current:${X}     ${current_query}"
+  echo ""
+  local ctx_start=$(( TXT_ACTIVE_IDX - 2 ))
+  local ctx_end=$(( TXT_ACTIVE_IDX + 3 ))
+  (( ctx_start < 0 )) && ctx_start=0
+  (( ctx_end > total - 1 )) && ctx_end=$(( total - 1 ))
+  local i=$ctx_start
+  while [ $i -le $ctx_end ]; do
+    local line="${TXT_LINES[$(( i + 1 ))]}"
+    if [ $i -eq $TXT_ACTIVE_IDX ]; then
+      echo "  ${G}▶ $(( i + 1 )). ${line}${X}"
+    else
+      echo "    $(( i + 1 )). ${line}"
+    fi
+    i=$(( i + 1 ))
+  done
+  echo ""
+}
+
+do_txts() {
+  echo ""
+  echo "  ${C}txt playlists  →  $TXTS_DIR${X}"
+  echo ""
+  local found=0
+  _txt_state_read
+  for f in "$TXTS_DIR"/*.txt(N); do
+    local name; name=$(basename "$f" .txt)
+    local count; count=$(grep -cvE '^\s*(#|$)' "$f" 2>/dev/null || echo 0)
+    local marker="  ∙"
+    [ "$f" = "$TXT_ACTIVE_FILE" ] && marker="  ${G}▶${X}"
+    echo "  ${marker} ${W}${name}${X}  (${count} songs)  ${C}→ m txt ${name}${X}"
+    found=1
+  done
+  [ $found -eq 0 ] && {
+    echo "  (none yet)"
+    echo ""
+    echo "  ${Y}How to add:${X} drop a .txt file into $TXTS_DIR"
+    echo "  One song name per line. Lines starting with # are comments."
+  }
+  echo ""
+}
+
+do_txtpick() {
+  _need
+  _txt_state_read
+  [ -z "$TXT_ACTIVE_FILE" ] && _err "no active txt playlist — start one with: m txt"
+
+  _txt_read_lines "$TXT_ACTIVE_FILE"
+  local total=${#TXT_LINES[@]}
+
+  local display=()
+  local i=0
+  while [ $i -lt $total ]; do
+    local marker="  "; [ $i -eq $TXT_ACTIVE_IDX ] && marker="▶ "
+    display+=("${marker}$(( i + 1 )). ${TXT_LINES[$(( i + 1 ))]}")
+    i=$(( i + 1 ))
+  done
+
+  local chosen
+  chosen=$(printf '%s\n' "${display[@]}" | "$FZF" \
+    --height 60% --reverse \
+    --prompt "📄 jump to > " \
+    --header "▶ = current · ENTER to play · ESC cancel" \
+    --no-sort)
+  [ -z "$chosen" ] && { _warn "cancelled"; return }
+
+  local num; num=$(echo "$chosen" | grep -oE '[0-9]+\.' | head -1 | tr -d '.')
+  [ -z "$num" ] && _err "could not parse selection"
+  local new_idx=$(( num - 1 ))
+  local query="${TXT_LINES[$num]}"
+
+  _info "searching: ${query}"
+  local url; url=$(_txt_search_and_play_line "$query")
+  [ -z "$url" ] && { _warn "could not find: $query"; return }
+
+  _txt_state_write "$TXT_ACTIVE_FILE" "$new_idx"
+  _txt_kill_bg_job
+
+  _silent '{"command":["playlist-clear"]}'
+  _ipc_loadfile "$url" "replace"
+  local title; title=$(_wait_prop media-title 20)
+  local total_n; total_n=${#TXT_LINES[@]}
+  _ok "▶  [${num}/${total_n}]  ${title:-$query}"
+}
+
+do_txtedit() {
+  local arg="$1"
+  local f
+  if [ -z "$arg" ]; then
+    local files=("$TXTS_DIR"/*.txt(N))
+    [ ${#files[@]} -eq 0 ] && _err "no txt files in $TXTS_DIR"
+    local picked
+    picked=$(printf '%s\n' "${files[@]}" | xargs -I{} basename {} .txt | "$FZF" \
+      --height 40% --reverse --prompt "✏  edit > " --header "pick file to edit")
+    [ -z "$picked" ] && { _warn "cancelled"; return }
+    f="$TXTS_DIR/${picked}.txt"
+  else
+    f=$(_txt_resolve "$arg")
+    [ -z "$f" ] && {
+      f="$TXTS_DIR/${arg}.txt"
+      _info "creating new txt playlist: $arg"
+      printf '# %s\n# one song name per line, blank lines and # lines are ignored\n\n' "$arg" > "$f"
+    }
+  fi
+  local editor="${EDITOR:-nano}"
+  "$editor" "$f"
+  local count; count=$(grep -cvE '^\s*(#|$)' "$f" 2>/dev/null || echo 0)
+  _ok "saved: $(basename "$f")  (${count} songs)"
+}
+
+# ── cache management ──────────────────────────────────────────
+
+do_cache_clear() {
+  local count; count=$(ls "$CACHE_DIR"/*.cache 2>/dev/null | wc -l | tr -d ' ')
+  rm -f "$CACHE_DIR"/*.cache
+  _ok "cleared ${count} cached search(es)"
+}
+
+do_cache_stats() {
+  local total=0 expired=0 fresh=0
+  for f in "$CACHE_DIR"/*.cache(N); do
+    total=$(( total + 1 ))
+    if [ "$(_cache_age "$f")" -ge "$CACHE_TTL" ]; then
+      expired=$(( expired + 1 ))
+    else
+      fresh=$(( fresh + 1 ))
+    fi
+  done
+  echo ""
+  echo "  ${C}cache stats:${X}"
+  echo "  total:   ${total}"
+  echo "  fresh:   ${G}${fresh}${X}  (TTL: ${CACHE_TTL}s)"
+  echo "  expired: ${Y}${expired}${X}  (auto-refreshed on next use)"
+  echo "  dir:     $CACHE_DIR"
+  echo ""
+}
+
+do_cache_prune() {
+  local count=0
+  for f in "$CACHE_DIR"/*.cache(N); do
+    if [ "$(_cache_age "$f")" -ge "$CACHE_TTL" ]; then
+      rm -f "$f"
+      count=$(( count + 1 ))
+    fi
+  done
+  _ok "pruned ${count} expired cache entrie(s)"
+}
+
+# ── devices ───────────────────────────────────────────────────
+
+do_devices() {
+  echo ""
+  echo "  ${C}audio devices:${X}"
+  "$MPV" --audio-device=help 2>&1 | grep "'" | sed 's/^/  /'
+  echo ""
+  echo "  current:     ${W}$(_get audio-device)${X}"
+  echo "  speakers:    ${W}${AUDIO_DEVICE_SPEAKERS:-not configured}${X}"
+  echo "  headphones:  ${W}${AUDIO_DEVICE_HEADPHONES:-not configured}${X}"
+  echo "  (set in: $CONFIG_FILE)"
+  echo ""
+}
+
+# ── help ──────────────────────────────────────────────────────
+
+do_help() {
+  cat <<EOF
+
+  ${C}m — terminal music CLI${X}   (v2 hardened)
+  data: ~/music_system/   config: $CONFIG_FILE
+
+  ${W}PLAY${X}
+    m "query"              search YouTube & play (fzf picker)
+    m ~/path/to/file.mp3   play a local file directly
+    m "query" -a           add to queue
+    m "query" -hp          play via headphones
+    m "query" -sp          play via speakers
+    m "query" -a -hp       add + switch to headphones
+
+  ${W}TRANSPORT${X}
+    pause / pp             toggle pause
+    next  / mn             next track
+    prev  / mb             previous track
+    seek +30               seek forward 30s
+    seek -15               seek back 15s
+    seek 1:30              jump to 1m30s
+    seek 90                jump to 90s
+    speed 1.5              set playback speed (0.25–4.0)
+    speed + / -            step speed up/down (true inverse)
+    speed r                reset speed to 1x
+    stop                   kill daemon (precise PID targeting)
+    start                  start daemon
+
+  ${W}VOLUME & OUTPUT${X}
+    vol                    show current volume
+    vol 80                 set volume (0-150)
+    vol + / -              step ±${VOLUME_STEP} (clamped 0-150)
+    hp / headphones        switch to headphones
+    sp / speakers          switch to speakers
+    devices                list audio devices + show config
+
+  ${W}INFO${X}
+    now                    current track + position + queue pos
+    bar / progress         live progress bar (updates every 0.5s)
+                             keys: p=pause  n=next  b=prev
+                                   ,=−10s  .=+10s  +/−=vol
+                                   r=repeat  1=repeat-one  q=quit
+    scrub / slider         interactive seek slider
+    queue                  show queue (correct highlight after shuffle)
+    status                 daemon status + queue count + txt state
+
+  ${W}QUEUE MANAGEMENT${X}
+    shuffle                shuffle queue
+    repeat / rp            toggle repeat-playlist
+    repeat-one / ro        toggle repeat-one (loop current track)
+    clear                  clear queue
+    qmove <from> <to>      move track in queue (1-based)
+    qrm <pos>              remove track from queue (1-based)
+
+  ${W}LIKES${X}
+    like                   ❤ like current track
+    unlike                 remove a liked track (fzf)
+    likes                  list liked tracks
+    likes-play / lp        pick & play a liked track (fzf)
+    love                   play random liked track (portable shuf)
+
+  ${W}HISTORY${X}
+    history                fuzzy-search & replay history (newest first)
+    history-clear          wipe play history (with confirmation)
+
+  ${W}TXT PLAYLISTS${X}
+    txts                   list all txt files with song counts
+    txt                    fzf-pick a txt file and start playing
+    txt <name>             load a specific txt file
+    txtnext / tn           next song in active txt playlist
+    txtprev / tp           previous song in active txt playlist
+    txtnow                 show active txt file + surrounding context
+    txtpick / tj           fzf-jump to any song in active txt
+    txtedit / te           fzf-pick a txt file to edit in \$EDITOR
+    txtedit <name>         edit or create a named txt file
+
+  ${W}QUEUE PLAYLISTS${X}
+    save <name>            save current queue as playlist
+    load <name>            load playlist into queue
+    playlists / pls        list saved playlists
+    pldel <name>           delete a playlist (with confirmation)
+
+  ${W}DOWNLOAD & IMPORT${X}
+    dl "query"             download as MP3 to ~/music_system/downloads/
+    dl-list                list downloaded files
+    import "url"           import a YouTube playlist as a saved playlist
+
+  ${W}CACHE${X}
+    cache-clear            remove all search caches
+    cache-prune            remove only expired caches (>TTL)
+    cache-stats            show cache info (respects CACHE_TTL config)
+
+EOF
+}
+
+# ── main dispatch ─────────────────────────────────────────────
+
+[ $# -eq 0 ] && { do_status; exit 0 }
+
+case "$1" in
+  pause|pp)            do_pause;                   exit 0 ;;
+  next|mn)             do_next;                    exit 0 ;;
+  prev|mb)             do_prev;                    exit 0 ;;
+  stop)                do_stop;                    exit 0 ;;
+  start)               do_start;                   exit 0 ;;
+  shuffle)             do_shuffle;                 exit 0 ;;
+  repeat|rp)           do_repeat;                  exit 0 ;;
+  repeat-one|ro)       do_repeat_one;              exit 0 ;;
+  clear)               do_clear;                   exit 0 ;;
+  now)                 do_now;                     exit 0 ;;
+  bar|progress)        do_bar;                     exit 0 ;;
+  scrub|slider)        do_scrub;                   exit 0 ;;
+  queue)               do_queue;                   exit 0 ;;
+  qmove)               do_queue_move "$2" "$3";    exit 0 ;;
+  qrm)                 do_queue_remove "$2";       exit 0 ;;
+  status)              do_status;                  exit 0 ;;
+  hp|headphones)       do_hp;                      exit 0 ;;
+  sp|speakers)         do_sp;                      exit 0 ;;
+  devices)             do_devices;                 exit 0 ;;
+  playlists|pls)       do_playlists;               exit 0 ;;
+  save)                do_save "$2";               exit 0 ;;
+  load)                do_load "$2";               exit 0 ;;
+  pldel)               do_playlist_del "$2";       exit 0 ;;
+  import)              do_import "$2";             exit 0 ;;
+  dl)                  do_dl "$2";                 exit 0 ;;
+  dl-list)             do_dl_list;                 exit 0 ;;
+  txt)                 do_txt "$2";                exit 0 ;;
+  txts)                do_txts;                    exit 0 ;;
+  txtnext|tn)          do_txtnext;                 exit 0 ;;
+  txtprev|tp)          do_txtprev;                 exit 0 ;;
+  txtnow)              do_txtnow;                  exit 0 ;;
+  txtpick|tj)          do_txtpick;                 exit 0 ;;
+  txtedit|te)          do_txtedit "$2";            exit 0 ;;
+  vol|volume)          do_vol "$2";                exit 0 ;;
+  seek)                do_seek "$2";               exit 0 ;;
+  speed)               do_speed "$2";              exit 0 ;;
+  like)                do_like;                    exit 0 ;;
+  unlike)              do_unlike;                  exit 0 ;;
+  likes)               do_likes;                   exit 0 ;;
+  likes-play|lp)       do_likes_play;              exit 0 ;;
+  love)                do_love;                    exit 0 ;;
+  history|hist)        do_history;                 exit 0 ;;
+  history-clear)       do_history_clear;           exit 0 ;;
+  cache-clear)         do_cache_clear;             exit 0 ;;
+  cache-prune)         do_cache_prune;             exit 0 ;;
+  cache-stats)         do_cache_stats;             exit 0 ;;
+  help|-h|--help)      do_help;                    exit 0 ;;
+esac
+
+# Free-form query with optional flags
+QUERY=""
+FLAG_ADD=0
+FLAG_HP=0
+FLAG_SP=0
+
+for arg in "$@"; do
+  case "$arg" in
+    -a|--add)          FLAG_ADD=1 ;;
+    -hp|--headphones)  FLAG_HP=1 ;;
+    -sp|--speakers)    FLAG_SP=1 ;;
+    -*)                _err "unknown flag: $arg  (run: m help)" ;;
+    *)                 QUERY="$QUERY $arg" ;;
+  esac
+done
+
+QUERY="${QUERY## }"
+[ -z "$QUERY" ] && _err "no query — usage: m \"song name\"  or  m help"
+
+if [ $FLAG_ADD -eq 1 ]; then
+  do_add "$QUERY"
+else
+  do_play "$QUERY"
+fi
+
+[ $FLAG_HP -eq 1 ] && sleep 0.4 && do_hp
+[ $FLAG_SP -eq 1 ] && sleep 0.4 && do_sp
