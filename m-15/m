@@ -1,0 +1,3938 @@
+#!/usr/bin/env zsh
+# ============================================================
+#  m — terminal music CLI  (hardened build v6 — "God Tier")
+#  All state lives in ~/music_system/
+#
+#  v5 changes over v4:
+#   v5-A  CRITICAL BUG FIX: _wait_prop now yields 0.3s before polling +
+#         retries if title looks like a URL → fixes "unknown" on first play
+#   v5-B  CRITICAL BUG FIX: _lock stale-steal no longer rmdir's unowned lock
+#   v5-C  CRITICAL BUG FIX: txt bg job PID written atomically BEFORE disown
+#   v5-D  _wait_prop: distinguishes "property unavailable" vs "still loading"
+#         via _get_checked() — no more 60-iteration spin on hard errors
+#   v5-E  _clean_url: handles YouTube Shorts (/shorts/ID), SoundCloud,
+#         Bandcamp; never calls _clean_url on local files
+#   v5-F  do_bar: cursor always restored after loop exit (not just trap)
+#   v5-G  do_similar: python3 replaced with jq @uri for URL encoding
+#   v5-H  do_export: CSV injection guard (prefix dangerous cells with tab)
+#   v5-I  _log_history: rolling dedup — won't log same URL within last 50 entries
+#   v5-J  _shuf1: reservoir sampling (O(1) memory, no modulo bias)
+#   v5-K  do_bar: single jq parse pass (was 9 forks/frame → 1)
+#   v5-L  SPEED: YouTube Data API v3 / Invidious search path (curl+jq, ms not s)
+#         Falls back to yt-dlp scrape if API key not set or request fails
+#   v5-M  SPEED: fzf --bind change:reload for live async search UI
+#   v5-N  SPEED: do_txt parallel resolution — all lines fetched concurrently
+#   v5-O  UI: m art — terminal album art via chafa (falls back gracefully)
+#   v5-P  UI: m lyrics — real-time synced lyrics from lrclib.net
+#   v5-Q  UI: m ui — unified TUI dashboard (queue + art + bar in tmux/split)
+#   v5-R  Auto-DJ / radio mode — queue auto-refills from Last.fm when empty
+#   v5-S  m add-next — insert track immediately after current queue position
+#   v5-T  m bookmark — named snapshot of queue + position + timestamp
+#   v5-U  m txt --resume — resume txt playlist from last saved position
+#   v5-V  m reload-config — hot-reload config without killing daemon
+#   v5-W  Graceful EXIT trap — always unlocks locks on shell exit
+#   v5-X  m index — scan ~/Music, build local library cache via ffprobe
+#   v5-Y  SponsorBlock note added to help (mpv lua script path documented)
+#   v5-Z  PIPESTATUS checks in _pick() and _txt_search_and_play_line()
+# ============================================================
+
+set -u
+
+# ── paths ────────────────────────────────────────────────────
+MUSIC_ROOT="${MUSIC_ROOT:-$HOME/music_system}"
+SOCKET_DIR="$MUSIC_ROOT/socket"
+SOCKET="$SOCKET_DIR/mpv.sock"
+MPV_PID_FILE="$SOCKET_DIR/mpv.pid"
+CACHE_DIR="$MUSIC_ROOT/cache"
+PLAYLIST_DIR="$MUSIC_ROOT/playlists"
+TXTS_DIR="$MUSIC_ROOT/txts"
+DOWNLOADS_DIR="$MUSIC_ROOT/downloads"
+DATA_DIR="$MUSIC_ROOT/data"
+LOCK_DIR="$MUSIC_ROOT/locks"
+LOCK_FILE="$LOCK_DIR/start.lock"
+LOCK_FILE_D="$LOCK_FILE.d"
+HISTORY_LOCK="$LOCK_DIR/history.lock"
+LIKES_FILE="$DATA_DIR/likes"
+HISTORY_FILE="$DATA_DIR/history"
+TXT_STATE_FILE="$DATA_DIR/txt_state"
+TXT_BG_GEN_FILE="$DATA_DIR/txt_bg_gen"
+QUEUE_SNAPSHOT="$DATA_DIR/queue_snapshot.m3u"
+MPV_LOG="$DATA_DIR/mpv.log"
+LOCAL_INDEX="$DATA_DIR/local_index.tsv"
+BOOKMARKS_FILE="$DATA_DIR/bookmarks"
+AUTODJ_FILE="$DATA_DIR/autodj_enabled"
+PINS_FILE="$DATA_DIR/pins"
+STATIONS_FILE="$MUSIC_ROOT/stations.tsv"
+AUTOSAVE_QUEUE_FILE="$DATA_DIR/autosave_queue.m3u"
+QUEUE_SAVE_AUTO_FILE="$DATA_DIR/queue_save_auto_enabled"
+VOLUME_SPEED_STATE="$DATA_DIR/volume_speed_state"
+TXT_LINES=()
+CONFIG_FILE="$MUSIC_ROOT/config"
+PLUGINS_DIR="$MUSIC_ROOT/plugins"
+
+# ── defaults (overridable via config file) ────────────────────
+CACHE_TTL=3600
+HISTORY_MAX=500
+DEFAULT_VOLUME=80
+VOLUME_STEP=5
+SEARCH_RESULTS=20
+AUDIO_DEVICE_SPEAKERS=""
+AUDIO_DEVICE_HEADPHONES=""
+SCROBBLE_URL=""
+YTDLP_MAX_AGE_DAYS=30
+LASTFM_API_KEY=""
+YOUTUBE_API_KEY=""         # v5-L: optional YouTube Data API v3 key for fast search
+INVIDIOUS_HOST=""          # v5-L: optional Invidious instance e.g. "https://invidious.snopyta.org"
+LOCAL_MUSIC_DIR="${HOME}/Music"
+AUTODJ_ENABLED=0           # v5-R: auto-refill queue from Last.fm when empty
+LYRICS_ENABLED=1           # v5-P: enable lrclib.net lyrics fetch
+NOTIFY_ENABLED=0           # desktop notification on track change
+CROSSFADE_SECS=0           # crossfade duration between tracks (0=off)
+BAR_REFRESH_MS=500         # progress bar refresh interval
+M_UPDATE_URL=""            # self-update URL (empty=disabled)
+M_UPDATE_SHA256=""         # expected SHA256 for self-update
+
+# ── load user config ──────────────────────────────────────────
+# shellcheck disable=SC1090
+[ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
+
+# v4-S — validate config (safe under set -u)
+_validate_config() {
+  local -a _cfg_checks
+  _cfg_checks=(
+    "CACHE_TTL:${CACHE_TTL}:1:86400"
+    "HISTORY_MAX:${HISTORY_MAX}:10:100000"
+    "DEFAULT_VOLUME:${DEFAULT_VOLUME}:0:150"
+    "VOLUME_STEP:${VOLUME_STEP}:1:50"
+    "SEARCH_RESULTS:${SEARCH_RESULTS}:1:50"
+    "YTDLP_MAX_AGE_DAYS:${YTDLP_MAX_AGE_DAYS}:1:365"
+  )
+  local entry var val min max
+  for entry in "${_cfg_checks[@]}"; do
+    var="${entry%%:*}"; local _rest="${entry#*:}"
+    val="${_rest%%:*}"; _rest="${_rest#*:}"
+    min="${_rest%%:*}"; max="${_rest#*:}"
+    if [[ ! "$val" =~ ^[0-9]+$ ]] || (( val < min || val > max )); then
+      echo "${Y}⚠ config: ${var}=${val} is invalid (expected integer ${min}–${max}), using default${X}" >&2
+    fi
+  done
+  [[ "$CACHE_TTL"      =~ ^[0-9]+$ ]] || CACHE_TTL=3600
+  [[ "$HISTORY_MAX"    =~ ^[0-9]+$ ]] || HISTORY_MAX=500
+  [[ "$DEFAULT_VOLUME" =~ ^[0-9]+$ ]] || DEFAULT_VOLUME=80
+  [[ "$VOLUME_STEP"    =~ ^[0-9]+$ ]] || VOLUME_STEP=5
+  [[ "$SEARCH_RESULTS" =~ ^[0-9]+$ ]] || SEARCH_RESULTS=20
+  (( DEFAULT_VOLUME > 150 )) && DEFAULT_VOLUME=150
+  (( VOLUME_STEP > 50 ))    && VOLUME_STEP=5
+}
+
+# ── colours ──────────────────────────────────────────────────
+R=$'\e[0;31m'; G=$'\e[0;32m'; Y=$'\e[0;33m'
+C=$'\e[0;36m'; W=$'\e[1;37m'; M=$'\e[0;35m'; X=$'\e[0m'
+DIM=$'\e[2m'; BOLD=$'\e[1m'
+
+# ── OS detection ─────────────────────────────────────────────
+_os() {
+  case "$(uname -s)" in
+    Darwin) echo "mac" ;;
+    Linux)  echo "linux" ;;
+    *)      echo "unknown" ;;
+  esac
+}
+OS=$(_os)
+
+# ── cross-platform helpers ────────────────────────────────────
+_md5() {
+  if [[ "$OS" == "mac" ]]; then md5
+  else md5sum | cut -c1-32
+  fi
+}
+
+_mtime() {
+  local f="$1"
+  if [[ "$OS" == "mac" ]]; then stat -f%m "$f" 2>/dev/null || echo 0
+  else stat -c%Y "$f" 2>/dev/null || echo 0
+  fi
+}
+
+_tac() {
+  if command -v tac &>/dev/null; then tac "$@"
+  else tail -r "$@"
+  fi
+}
+
+# v5-J — _shuf1: reservoir sampling O(1) memory, unbiased
+_shuf1() {
+  local f="$1"
+  [[ -s "$f" ]] || return 1
+  awk 'BEGIN{srand()} {if(rand()<1/NR) r=$0} END{if(NR>0) print r}' "$f"
+}
+
+# ── locking (v5-B: stale-steal no longer rmdir's unowned lock) ──────────────
+# _lock <lockfile_base> [timeout_seconds]
+# Atomic sentinel: mkdir of <lockfile_base>.d
+# Stale steal: only steals if the owning PID is dead AND we successfully
+# mkdir AFTER removing the stale sentinel — never rmdir a live lock.
+_lock() {
+  local lf="$1" timeout="${2:-5}"
+  local deadline=$(( $(date +%s) + timeout ))
+  local steal_count=0 MAX_STEALS=3
+
+  while true; do
+    # Try atomic acquire
+    if mkdir "${lf}.d" 2>/dev/null; then
+      echo $$ > "$lf"
+      return 0
+    fi
+
+    # Lock held — check if stale
+    if [[ $(date +%s) -gt $deadline ]]; then
+      if [[ $steal_count -lt $MAX_STEALS && -f "$lf" ]]; then
+        local dead_pid; dead_pid=$(cat "$lf" 2>/dev/null)
+        if [[ -n "$dead_pid" ]] && ! kill -0 "$dead_pid" 2>/dev/null; then
+          # PID is dead. Two-phase steal: rename PID file first (atomic claim),
+          # then rmdir only if rename succeeded — avoids TOCTOU race.
+          if mv "$lf" "${lf}.stale" 2>/dev/null; then
+            rmdir "${lf}.d" 2>/dev/null
+            rm -f "${lf}.stale"
+            steal_count=$(( steal_count + 1 ))
+            deadline=$(( $(date +%s) + timeout ))
+            continue  # immediately retry mkdir
+          fi
+        fi
+      fi
+      return 1  # live lock or max steals exceeded
+    fi
+    sleep 0.05
+  done
+}
+
+_unlock() {
+  local lf="$1"
+  local stored_pid; stored_pid=$(cat "$lf" 2>/dev/null)
+  if [[ "$stored_pid" == "$$" ]]; then
+    rm -f "$lf"
+    rmdir "${lf}.d" 2>/dev/null
+  fi
+}
+
+# v5-W — graceful EXIT trap: always release locks on shell exit
+trap '_unlock "$LOCK_FILE" 2>/dev/null; _unlock "$HISTORY_LOCK" 2>/dev/null' EXIT
+
+# ── binary resolution ─────────────────────────────────────────
+_resolve_bin() {
+  local name="$1"
+  local found; found=$(command -v "$name" 2>/dev/null)
+  [ -n "$found" ] && { echo "$found"; return 0; }
+  for prefix in /opt/homebrew/bin /usr/local/bin /home/linuxbrew/.linuxbrew/bin; do
+    [ -x "$prefix/$name" ] && { echo "$prefix/$name"; return 0; }
+  done
+  echo ""; return 1
+}
+
+YTDLP="${YTDLP:-$(_resolve_bin yt-dlp)}"
+MPV="${MPV:-$(_resolve_bin mpv)}"
+FZF="${FZF:-$(_resolve_bin fzf)}"
+SOCAT="${SOCAT:-$(_resolve_bin socat)}"
+JQ="${JQ:-$(_resolve_bin jq)}"
+CURL="${CURL:-$(_resolve_bin curl)}"
+CHAFA="${CHAFA:-$(_resolve_bin chafa)}"    # v5-O: optional, for album art
+FFPROBE="${FFPROBE:-$(_resolve_bin ffprobe)}" # v5-X: optional, for local index
+
+# ── bootstrap dirs ────────────────────────────────────────────
+_bootstrap() {
+  mkdir -p "$SOCKET_DIR" "$CACHE_DIR" "$PLAYLIST_DIR" \
+           "$TXTS_DIR" "$DOWNLOADS_DIR" "$DATA_DIR" "$LOCK_DIR" "$PLUGINS_DIR"
+  [[ ! -f "$LIKES_FILE" ]]   && touch "$LIKES_FILE"
+  [[ ! -f "$HISTORY_FILE" ]] && touch "$HISTORY_FILE"
+  [[ ! -f "$BOOKMARKS_FILE" ]] && touch "$BOOKMARKS_FILE"
+  [[ ! -f "$PINS_FILE" ]] && touch "$PINS_FILE"
+  if [[ ! -f "$STATIONS_FILE" ]]; then
+    printf '# genre\tname\turl\n# rock\tBBC Radio 1\thttps://stream.example.com/radio1\n' > "$STATIONS_FILE"
+  fi
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    cat > "$CONFIG_FILE" <<'EOF'
+# m — user config  (uncomment + edit to override defaults)
+# CACHE_TTL=3600
+# HISTORY_MAX=500
+# DEFAULT_VOLUME=80
+# VOLUME_STEP=5
+# SEARCH_RESULTS=20
+# YTDLP_MAX_AGE_DAYS=30
+# YTDLP=/usr/local/bin/yt-dlp
+# MPV=/usr/local/bin/mpv
+# AUDIO_DEVICE_SPEAKERS=coreaudio/BuiltInSpeakerDevice
+# AUDIO_DEVICE_HEADPHONES=coreaudio/BuiltInHeadphoneOutputDevice
+# SCROBBLE_URL=https://api.listenbrainz.org/1/submit-listens
+# LASTFM_API_KEY=your_key_here      # enables real similar-track recommendations
+# YOUTUBE_API_KEY=your_key_here     # v5: enables fast YouTube Data API search (ms vs s)
+# INVIDIOUS_HOST=https://invidious.snopyta.org  # v5: privacy-friendly search alternative
+# LOCAL_MUSIC_DIR=$HOME/Music       # v5: local library root for m index
+# AUTODJ_ENABLED=0                  # v5: 1 = auto-refill queue from Last.fm when empty
+# LYRICS_ENABLED=1                  # v5: 0 = disable real-time lyrics
+# NOTIFY_ENABLED=0                  # 1 = desktop notification on track change
+# CROSSFADE_SECS=0                  # crossfade duration between tracks (0=off)
+# BAR_REFRESH_MS=500                # progress bar refresh interval
+# M_UPDATE_URL=                     # self-update URL (empty=disabled)
+# M_UPDATE_SHA256=                  # expected SHA256 for self-update
+EOF
+  fi
+}
+_bootstrap
+
+# ── logging helpers (structured exit codes: 1=general 2=dep 3=daemon 4=nothing playing 5=search 6=file 7=network) ──
+_die() {
+  local code=1
+  if [[ "${1:-}" =~ ^[0-9]+$ ]]; then code="$1"; shift; fi
+  echo "${R}✖ $*${X}" >&2
+  exit "$code"
+}
+_err() {
+  local code=1
+  if [[ "${1:-}" =~ ^[0-9]+$ ]]; then code="$1"; shift; fi
+  echo "${R}✖ $*${X}" >&2
+  return "$code"
+}
+_ok()   { echo "${G}✔ $*${X}"; }
+_info() { echo "${C}→ $*${X}"; }
+_warn() { echo "${Y}⚠ $*${X}"; }
+
+# ── dependency check ──────────────────────────────────────────
+_check_deps() {
+  local missing=0
+  for bin in "$YTDLP" "$MPV" "$FZF" "$SOCAT" "$JQ"; do
+    if [[ -z "$bin" || ! -x "$bin" ]]; then
+      _warn "missing binary: ${bin:-<unresolved>}"
+      missing=1
+    fi
+  done
+  if [[ $missing -eq 1 ]]; then
+    _die 2 "install missing deps:\n  macOS: brew install yt-dlp mpv fzf socat jq\n  Linux: sudo apt install mpv socat jq fzf && pip install yt-dlp"
+  fi
+  # Optional deps: just warn, don't die
+  [[ -z "$CURL" || ! -x "$CURL" ]] && _warn "curl not found — API search, lyrics, scrobble disabled"
+  [[ -z "$CHAFA" || ! -x "$CHAFA" ]] && true  # silent, chafa is optional
+}
+_check_deps
+_validate_config
+
+# ── yt-dlp freshness check ────────────────────────────────────
+_check_ytdlp_age() {
+  local ver_file="$CACHE_DIR/.ytdlp_version_check"
+  local age; age=$(_cache_age "$ver_file" 2>/dev/null || echo 99999)
+  (( age < 86400 )) && return
+  touch "$ver_file"
+  local ver_str; ver_str=$("$YTDLP" --version 2>/dev/null | head -1)
+  local ver_date; ver_date=$(echo "$ver_str" | grep -oE '^[0-9]{4}\.[0-9]{2}\.[0-9]{2}')
+  [[ -z "$ver_date" ]] && return
+  local ver_epoch
+  if [[ "$OS" == "mac" ]]; then
+    ver_epoch=$(date -j -f "%Y.%m.%d" "$ver_date" "+%s" 2>/dev/null || echo 0)
+  else
+    ver_epoch=$(date -d "${ver_date//./-}" "+%s" 2>/dev/null || echo 0)
+  fi
+  local now; now=$(date +%s)
+  local days_old=$(( (now - ver_epoch) / 86400 ))
+  if (( days_old > YTDLP_MAX_AGE_DAYS )); then
+    _warn "yt-dlp is ${days_old} days old (${ver_str}) — run: m update"
+  fi
+}
+
+# ── audio device detection ────────────────────────────────────
+_detect_audio_devices() {
+  [[ "$OS" != "mac" ]] && return
+  [[ -z "$AUDIO_DEVICE_SPEAKERS"   ]] && AUDIO_DEVICE_SPEAKERS="coreaudio/BuiltInSpeakerDevice"
+  [[ -z "$AUDIO_DEVICE_HEADPHONES" ]] && AUDIO_DEVICE_HEADPHONES="coreaudio/BuiltInHeadphoneOutputDevice"
+}
+_detect_audio_devices
+
+# ── daemon management ─────────────────────────────────────────
+_start() {
+  [ -S "$SOCKET" ] && return 0
+  if ! _lock "$LOCK_FILE" 5; then
+    _info "waiting for daemon to start..."
+    for i in $(seq 1 30); do
+      sleep 0.3
+      [ -S "$SOCKET" ] && return 0
+    done
+    _die 3 "daemon failed to start (lock timeout)"
+  fi
+  if [ -S "$SOCKET" ]; then
+    _unlock "$LOCK_FILE"; return 0
+  fi
+  _info "starting daemon..."
+  # Remove any stale socket left by a previously crashed mpv.
+  # Without this, _start() sees [ -S "$SOCKET" ] = true on next call and returns
+  # early thinking the daemon is running, causing all IPC to silently fail.
+  rm -f "$SOCKET" 2>/dev/null
+
+  local device_flag=""
+  [[ -n "$AUDIO_DEVICE_SPEAKERS" ]] && device_flag="--audio-device=$AUDIO_DEVICE_SPEAKERS"
+  local gapless_flag=""
+  [[ "${CROSSFADE_SECS:-0}" != "0" ]] && gapless_flag="--gapless-audio=yes"
+  "$MPV" --no-video --idle=yes \
+    --input-ipc-server="$SOCKET" \
+    --script-opts=ytdl_hook-ytdl_path="$YTDLP" \
+    ${device_flag:+"$device_flag"} \
+    ${gapless_flag:+"$gapless_flag"} \
+    --volume="$DEFAULT_VOLUME" \
+    --quiet --really-quiet \
+    --ytdl-format="bestaudio/best" \
+    --cache=yes --cache-secs=60 \
+    --demuxer-max-bytes=50MiB \
+    --prefetch-playlist=yes \
+    --save-position-on-quit=no \
+    2>>"$MPV_LOG" &
+  local mpv_pid=$!
+  disown $mpv_pid
+  echo $mpv_pid > "$MPV_PID_FILE"
+  for i in $(seq 1 30); do
+    sleep 0.3
+    if [ -S "$SOCKET" ]; then
+      # Restore volume/speed from last session
+      if [[ -f "$VOLUME_SPEED_STATE" ]]; then
+        sleep 0.3
+        local v s
+        v=$(awk -F= '$1=="volume"{print $2; exit}' "$VOLUME_SPEED_STATE")
+        s=$(awk -F= '$1=="speed"{print $2; exit}' "$VOLUME_SPEED_STATE")
+        [[ -n "$v" ]] && echo "{\"command\":[\"set_property\",\"volume\",$v]}" | "$SOCAT" - "$SOCKET" >/dev/null 2>&1
+        [[ -n "$s" ]] && echo "{\"command\":[\"set_property\",\"speed\",$s]}" | "$SOCAT" - "$SOCKET" >/dev/null 2>&1
+      fi
+      _unlock "$LOCK_FILE"; return 0
+    fi
+  done
+  _unlock "$LOCK_FILE"
+  rm -f "$MPV_PID_FILE"
+  _die 3 "mpv daemon failed to start — check: $MPV_LOG"
+}
+
+_need() {
+  if [ ! -S "$SOCKET" ]; then
+    _die 3 "daemon not running — run: m start"
+  fi
+  if ! echo '{"command":["get_version"]}' \
+        | "$SOCAT" -t 2 - "$SOCKET" >/dev/null 2>&1; then
+    _die 3 "daemon socket exists but mpv is unresponsive — run: m stop && m start"
+  fi
+}
+
+# ── IPC helpers ───────────────────────────────────────────────
+_cmd() {
+  echo "$1" | "$SOCAT" - "$SOCKET" 2>/dev/null
+}
+
+_silent() {
+  echo "$1" | "$SOCAT" - "$SOCKET" >/dev/null 2>&1
+}
+
+_silent_retry() {
+  local json="$1" attempts="${2:-3}" i
+  for i in $(seq 1 $attempts); do
+    if echo "$json" | "$SOCAT" - "$SOCKET" >/dev/null 2>&1; then return 0; fi
+    sleep 0.1
+  done
+  return 1
+}
+
+_get() {
+  local raw
+  raw=$(_cmd "{\"command\":[\"get_property\",\"$1\"]}")
+  echo "$raw" | "$JQ" -r '.data // empty' 2>/dev/null
+}
+
+# v5-D — _get_checked: distinguishes "unavailable" from "still loading"
+# Returns the value, or empty string. Sets _GET_ERROR to "unavailable" if
+# mpv explicitly says property is unavailable (vs just not ready yet).
+_GET_ERROR=""
+_get_checked() {
+  _GET_ERROR=""
+  local raw; raw=$(_cmd "{\"command\":[\"get_property\",\"$1\"]}")
+  local err; err=$(echo "$raw" | "$JQ" -r '.error // empty' 2>/dev/null)
+  if [[ "$err" == "property unavailable" || "$err" == "invalid parameter" ]]; then
+    _GET_ERROR="unavailable"
+    echo ""
+    return 1
+  fi
+  echo "$raw" | "$JQ" -r '.data // empty' 2>/dev/null
+}
+
+_get_multi() {
+  local result="{" first=1
+  for prop in "$@"; do
+    local val; val=$(_get "$prop")
+    [[ $first -eq 0 ]] && result="${result},"
+    result="${result}\"${prop}\":$("$JQ" -n --arg v "$val" '$v' 2>/dev/null || echo "null")"
+    first=0
+  done
+  result="${result}}"
+  echo "$result"
+}
+
+# v5-A — _wait_prop: yields 0.3s before first poll, checks for hard errors,
+# retries if title looks like a URL (mpv not yet resolved metadata)
+_wait_prop() {
+  local prop="$1" max="${2:-60}" val
+  local -a spinner
+  spinner=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  local si=0 sleep_ms=100 _is_url=0 sp=""
+
+  # v5-A: brief initial yield so mpv can start the load before we poll
+  sleep 0.3
+
+  for i in $(seq 1 "$max"); do
+    val=$(_get_checked "$prop")
+
+    # v5-D: hard error → stop spinning immediately
+    if [[ "$_GET_ERROR" == "unavailable" ]]; then
+      printf '\r\e[2K' >&2
+      echo ""
+      return 1
+    fi
+
+    # v5-A: reject if value looks like a raw URL or URL fragment (title not resolved yet)
+    _is_url=0
+    [[ "$val" == http* ]] && _is_url=1
+    [[ "$val" == *"watch?v="* ]] && _is_url=1
+    [[ "$val" == *"?v="* ]] && _is_url=1
+    [[ "$val" == youtu* ]] && _is_url=1
+    [[ "$val" == "null" ]] && _is_url=1
+    if [[ -n "$val" && $_is_url -eq 0 ]]; then
+      printf '\r\e[2K' >&2
+      echo "$val"
+      return 0
+    fi
+
+    sp="${spinner[$(( (si % ${#spinner[@]}) + 1 ))]}"
+    printf '\r\e[2K  %s buffering...' "$sp" >&2
+    si=$(( si + 1 ))
+    (( i % 10 == 0 && sleep_ms < 800 )) && sleep_ms=$(( sleep_ms * 2 ))
+    sleep $(awk "BEGIN{printf \"%.3f\", $sleep_ms/1000}")
+  done
+
+  printf '\r\e[2K' >&2
+
+  # v5-A: one final retry with a longer wait if we timed out
+  sleep 1
+  val=$(_get media-title)
+  if [[ -n "$val" && "$val" != http* && "$val" != *"watch?v="* && "$val" != "null" && "$val" != youtu* ]]; then
+    echo "$val"; return 0
+  fi
+
+  echo ""
+}
+
+# _wait_title <url> [max_iterations]
+# Smart wrapper: gives extra initial time for YouTube URLs before polling media-title.
+# Fixes "watch?v=ID" being returned before yt-dlp resolves metadata.
+_wait_title() {
+  local url="$1" max="${2:-60}"
+  local initial_wait=0.3
+  [[ "$url" == http* || "$url" == *youtu* || "$url" == *youtube* ]] && initial_wait=1.5
+  sleep "$initial_wait"
+  _wait_prop media-title "$max"
+}
+
+_ipc_cmd() {
+  local cmd_json
+  cmd_json=$("$JQ" -cn --args '{"command":$ARGS.positional}' -- "$@")
+  _silent_retry "$cmd_json"
+}
+
+_ipc_loadfile() {
+  local url="$1" mode="${2:-append-play}"
+  local json
+  json=$("$JQ" -cn --arg url "$url" --arg mode "$mode" \
+    '{"command":["loadfile",$url,$mode]}')
+  _silent_retry "$json"
+}
+
+# ── cache helpers ─────────────────────────────────────────────
+# v4-T: include $USER in cache key
+_cache_key() {
+  printf '%s\0%s' "${USER:-$(id -un)}" "$1" | _md5 | tr -d ' \n'
+}
+
+_cache_age() {
+  local f="$1"
+  [ -f "$f" ] || { echo 9999; return; }
+  echo $(( $(date +%s) - $(_mtime "$f") ))
+}
+
+# ── v5-L — Fast search: YouTube Data API v3 / Invidious / yt-dlp fallback ─────
+#
+# Priority: YouTube Data API v3 (if YOUTUBE_API_KEY set)
+#         → Invidious API (if INVIDIOUS_HOST set)
+#         → yt-dlp scrape (always available, slowest)
+#
+# Returns lines of format: "Title | Duration | URL"
+
+_search_youtube_api() {
+  local query="$1" n="${2:-$SEARCH_RESULTS}"
+  [[ -z "$YOUTUBE_API_KEY" || -z "$CURL" || ! -x "$CURL" ]] && return 1
+
+  local encoded_q; encoded_q=$(printf '%s' "$query" | "$JQ" -Rr '@uri' 2>/dev/null)
+  [[ -z "$encoded_q" ]] && return 1
+
+  local resp
+  resp=$("$CURL" -sf --max-time 8 \
+    "https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoCategoryId=10&maxResults=${n}&q=${encoded_q}&key=${YOUTUBE_API_KEY}" \
+    2>/dev/null) || return 1
+
+  # Extract video IDs, then fetch durations in one batch call
+  local ids; ids=$(echo "$resp" | "$JQ" -r '.items[].id.videoId' 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+  [[ -z "$ids" ]] && return 1
+
+  local details
+  details=$("$CURL" -sf --max-time 8 \
+    "https://www.googleapis.com/youtube/v3/videos?part=contentDetails,snippet&id=${ids}&key=${YOUTUBE_API_KEY}" \
+    2>/dev/null) || return 1
+
+  # Format output: "Title | Duration | URL"
+  echo "$details" | "$JQ" -r '
+    .items[] |
+    .id as $id |
+    .snippet.title as $title |
+    (.contentDetails.duration |
+      ltrimstr("PT") |
+      # parse ISO 8601 duration PT#H#M#S (// 0 guards null capture groups)
+      (capture("(?:(?<h>[0-9]+)H)?(?:(?<m>[0-9]+)M)?(?:(?<s>[0-9]+)S)?") |
+       (((.h | tonumber?) // 0) * 3600 +
+        ((.m | tonumber?) // 0) * 60 +
+        ((.s | tonumber?) // 0))) |
+      . as $total |
+      "\(if $total >= 3600 then "\($total/3600|floor):" else "" end)\(($total%3600)/60|floor|tostring|if length<2 then "0"+. else . end):\($total%60|floor|tostring|if length<2 then "0"+. else . end)"
+    ) as $dur |
+    "\($title) | \($dur) | https://www.youtube.com/watch?v=\($id)"
+  ' 2>/dev/null
+}
+
+_search_invidious() {
+  local query="$1" n="${2:-$SEARCH_RESULTS}"
+  [[ -z "$INVIDIOUS_HOST" || -z "$CURL" || ! -x "$CURL" ]] && return 1
+
+  local encoded_q; encoded_q=$(printf '%s' "$query" | "$JQ" -Rr '@uri' 2>/dev/null)
+  [[ -z "$encoded_q" ]] && return 1
+
+  local resp
+  resp=$("$CURL" -sf --max-time 8 \
+    "${INVIDIOUS_HOST}/api/v1/search?q=${encoded_q}&type=video&fields=title,videoId,lengthSeconds&page=1" \
+    2>/dev/null) || return 1
+
+  echo "$resp" | "$JQ" -r --argjson n "$n" '
+    .[:$n][] |
+    .title as $t |
+    .videoId as $id |
+    (.lengthSeconds |
+      . as $total |
+      "\(if $total >= 3600 then "\($total/3600|floor):" else "" end)\(($total%3600)/60|floor|tostring|if length<2 then "0"+. else . end):\($total%60|floor|tostring|if length<2 then "0"+. else . end)"
+    ) as $dur |
+    "\($t) | \($dur) | https://www.youtube.com/watch?v=\($id)"
+  ' 2>/dev/null
+}
+
+# _search_ytdlp() {
+#   local query="$1" n="${2:-$SEARCH_RESULTS}"
+#   local results
+#   results=$("$YTDLP" "ytsearch${n}:${query}" \
+#     --print "%(title)s | %(duration_string)s | %(webpage_url)s" \
+#     --no-download --no-warnings 2>/dev/null)
+
+#   # v5-Z: PIPESTATUS check — ytdlp exit code captured before pipe
+#   local ytdlp_rc=$?
+#   [[ $ytdlp_rc -ne 0 ]] && return 1
+
+#   echo "$results"
+# }
+
+# # _do_search: tries API → Invidious → yt-dlp, caches result
+# _do_search() {
+#   local query="$1" n="${2:-$SEARCH_RESULTS}"
+#   local key="$CACHE_DIR/$(_cache_key "$query").cache"
+
+#   if [ -f "$key" ] && [ "$(_cache_age "$key")" -lt "$CACHE_TTL" ]; then
+#     cat "$key"; return 0
+#   fi
+
+#   local results=""
+#   if [[ -n "$YOUTUBE_API_KEY" ]]; then
+#     results=$(_search_youtube_api "$query" "$n")
+#   fi
+#   if [[ -z "$results" && -n "$INVIDIOUS_HOST" ]]; then
+#     results=$(_search_invidious "$query" "$n")
+#   fi
+#   if [[ -z "$results" ]]; then
+#     _info "searching (yt-dlp)..." >&2
+#     results=$(_search_ytdlp "$query" "$n")
+#   fi
+
+#   local valid_count; valid_count=$(echo "$results" | grep -cE 'https?://' 2>/dev/null || echo 0)
+#   if [[ -n "$results" ]] && (( valid_count >= 1 )); then
+#     echo "$results" > "$key"
+#     echo "$results"
+#     return 0
+#   fi
+
+#   rm -f "$key"
+#   return 1
+# }
+
+# ── STREAMING yt-dlp search (results appear one by one) ──────
+_search_ytdlp_stream() {
+  local query="$1" n="${2:-$SEARCH_RESULTS}"
+  # BUG FIX: was `return ${PIPESTATUS[0]:-$?}` — PIPESTATUS is only set after
+  # a pipeline; this is a plain command so PIPESTATUS is unset → crash under
+  # set -u. Just use $? which correctly holds yt-dlp's exit code.
+  "$YTDLP" "ytsearch${n}:${query}" \
+    --print "%(title)s | %(duration_string)s | %(webpage_url)s" \
+    --no-download --no-warnings 2>/dev/null
+  return $?
+}
+
+# _do_search: tries API → Invidious → streaming yt-dlp, caches result
+#
+# API paths: buffered (already fast, single HTTP round-trip)
+# yt-dlp path: streams line-by-line into a tmpfile, promoted to cache
+#   AFTER fzf exits so the cache is never truncated by a mid-stream ESC.
+_do_search() {
+  local query="$1" n="${2:-$SEARCH_RESULTS}"
+  local key="$CACHE_DIR/$(_cache_key "$query").cache"
+
+  # Cache hit: instant
+  if [ -f "$key" ] && [ "$(_cache_age "$key")" -lt "$CACHE_TTL" ]; then
+    cat "$key"; return 0
+  fi
+
+  # Fast API paths (buffered — already near-instant, no need to stream)
+  local results=""
+  if [[ -n "$YOUTUBE_API_KEY" ]]; then
+    results=$(_search_youtube_api "$query" "$n")
+  fi
+  if [[ -z "$results" && -n "$INVIDIOUS_HOST" ]]; then
+    results=$(_search_invidious "$query" "$n")
+  fi
+
+  # API succeeded → cache + emit
+  if [[ -n "$results" ]]; then
+    local valid_count; valid_count=$(echo "$results" | grep -cE 'https?://' 2>/dev/null || echo 0)
+    if (( valid_count >= 1 )); then
+      echo "$results" > "$key"
+      echo "$results"
+      return 0
+    fi
+  fi
+
+  # ── Streaming yt-dlp path ─────────────────────────────────
+  # Stream yt-dlp stdout through a named pipe so fzf sees results
+  # line-by-line. We do NOT tee into the cache here because fzf closing
+  # its stdin (on ESC or ENTER) would send SIGPIPE to tee mid-stream,
+  # truncating the tmpfile. Instead we write the cache file separately
+  # after yt-dlp finishes (in the background), keyed to the same query.
+  _info "searching (yt-dlp — streaming)..." >&2
+
+  # Write to tmpfile in background while also streaming to stdout via fifo
+  local tmpfile; tmpfile=$(mktemp "$CACHE_DIR/.search_tmp.XXXXXX")
+  local fifo; fifo=$(mktemp -u "$CACHE_DIR/.fifo.XXXXXX")
+  mkfifo "$fifo" || { rm -f "$tmpfile"; _search_ytdlp_stream "$query" "$n"; return $?; }
+
+  # yt-dlp writes to both the fifo (→ stdout for fzf) and tmpfile (→ cache)
+  # The subshell runs yt-dlp, tees to tmpfile, and feeds the fifo.
+  # We use a background process so the fifo reader (cat below) can start.
+  {
+    _search_ytdlp_stream "$query" "$n" | tee "$tmpfile" > "$fifo"
+    # After yt-dlp finishes (fifo closed), validate and promote cache
+    local valid; valid=$(grep -cE 'https?://' "$tmpfile" 2>/dev/null || echo 0)
+    if (( valid >= 1 )); then
+      mv "$tmpfile" "$key" 2>/dev/null || rm -f "$tmpfile"
+    else
+      rm -f "$tmpfile"
+    fi
+    rm -f "$fifo"
+  } &
+  local bg_pid=$!
+
+  # Stream fifo to our stdout (fzf reads this)
+  cat "$fifo" 2>/dev/null
+  local rc=$?
+
+  # Clean up: if fzf exited early (ESC), the bg job may still be running.
+  # Kill it so yt-dlp doesn't linger, and clean up tmpfile.
+  kill "$bg_pid" 2>/dev/null
+  wait "$bg_pid" 2>/dev/null
+  rm -f "$fifo" "$tmpfile" 2>/dev/null
+
+  return $rc
+}
+
+
+# ── v5-M — Live async fzf search: opens instantly, results load as you type ──
+# Uses fzf --bind change:reload so the UI is immediate with no initial wait.
+# If YOUTUBE_API_KEY or INVIDIOUS_HOST is set, this is near-instant.
+# Falls back to yt-dlp otherwise (slower but still async).
+
+_pick_async() {
+  # Build the reload command — uses the same search priority
+  local search_cmd
+  if [[ -n "$YOUTUBE_API_KEY" ]]; then
+    # Fast path: API search inline (no yt-dlp spawn)
+    search_cmd="$0 _internal_search_api {q}"
+  else
+    # Slower but works without API key
+    search_cmd="\"$YTDLP\" \"ytsearch${SEARCH_RESULTS}:{q}\" --print '%(title)s | %(duration_string)s | %(webpage_url)s' --no-download --no-warnings 2>/dev/null || echo 'no results'"
+  fi
+
+  local result
+  result=$(FZF_DEFAULT_COMMAND="" "$FZF" \
+    --height 60% --reverse \
+    --prompt "🎵 " \
+    --header "Type to search YouTube · ENTER select · ESC cancel" \
+    --preview 'echo {} | sed "s/ | /\n/g"' \
+    --preview-window=down:3:wrap \
+    --ansi \
+    --disabled \
+    --query "" \
+    --bind "change:reload:$search_cmd 2>/dev/null || echo ''" \
+    --bind "start:reload:echo ''" \
+    2>/dev/null) || return 1
+
+  echo "$result" | awk -F ' \| ' '{print $NF}'
+}
+
+# _fzf_common: top-level helper (zsh nested functions don't capture outer scope)
+_fzf_common() {
+  local header="$1"
+  "$FZF" \
+    --height 55% --reverse \
+    --prompt "🎵 " \
+    --header "$header" \
+    --preview 'echo {} | sed "s/ | /\n/g"' \
+    --preview-window=down:3:wrap \
+    --ansi
+}
+
+# _pick: standard search with cache, then fzf picker
+# Uses async UI if available, cached results otherwise
+# _pick() {
+#   local query="$1"
+#   local key="$CACHE_DIR/$(_cache_key "$query").cache"
+#   local results
+
+#   if [ -f "$key" ] && [ "$(_cache_age "$key")" -lt "$CACHE_TTL" ]; then
+#     results=$(cat "$key")
+#     _info "instant results (cached)" >&2
+#   else
+#     [[ -n "$YOUTUBE_API_KEY" || -n "$INVIDIOUS_HOST" ]] && _info "searching (API)..." >&2 || _info "searching (yt-dlp — add YOUTUBE_API_KEY to config for instant search)..." >&2
+#     results=$(_do_search "$query")
+#   fi
+
+#   [[ -z "$results" ]] && { _warn "no results for: $query"; return 1; }
+
+#   echo "$results" | "$FZF" \
+#     --height 55% --reverse \
+#     --prompt "🎵 " \
+#     --header "ENTER select · ESC cancel · cached=instant | ${#results}" \
+#     --preview 'echo {} | sed "s/ | /\n/g"' \
+#     --preview-window=down:3:wrap \
+#     --ansi \
+#   | awk -F ' \| ' '{print $NF}'
+# }
+
+_pick() {
+  local query="$1"
+  local key="$CACHE_DIR/$(_cache_key "$query").cache"
+  local fzf_out url fzf_rc
+
+  # Cache hit — instant
+  if [ -f "$key" ] && [ "$(_cache_age "$key")" -lt "$CACHE_TTL" ]; then
+    _info "instant results (cached)" >&2
+    fzf_out=$(cat "$key" | _fzf_common "ENTER select · ESC cancel (cached)")
+    fzf_rc=$?
+    # BUG FIX: was `return ${PIPESTATUS[0]}` which returned cat's rc (always 0),
+    # not fzf's. ESC → fzf exits 130, but cat exits 0, so _pick wrongly
+    # returned 0 with empty output and do_play would proceed with empty URL.
+    (( fzf_rc != 0 )) && return 1
+    url=$(echo "$fzf_out" | awk -F ' \| ' '{print $NF}')
+    echo "$url"
+    return 0
+  fi
+
+  # Live path — _do_search announces itself, don't double-print
+  # BUG FIX: removed the duplicate _info "searching..." here; _do_search
+  # already prints "searching (yt-dlp — streaming)..." so we were getting
+  # two "searching..." messages on every non-cached yt-dlp search.
+  [[ -n "$YOUTUBE_API_KEY" || -n "$INVIDIOUS_HOST" ]] \
+    && _info "searching (API)..." >&2
+
+  fzf_out=$(_do_search "$query" | _fzf_common "ENTER select · ESC cancel  (loading...)")
+  fzf_rc=$?
+  # BUG FIX: pipeline `_do_search | fzf | awk` meant awk's rc (always 0) was
+  # returned. Now we capture fzf's rc directly before awk runs.
+  (( fzf_rc != 0 )) && return 1
+  url=$(echo "$fzf_out" | awk -F ' \| ' '{print $NF}')
+  echo "$url"
+  return 0
+}
+
+# ── desktop notification (Phase 2.14) ─────────────────────────
+_notify_track() {
+  [[ "${NOTIFY_ENABLED:-0}" != "1" ]] && return
+  local title="${1:-unknown}"
+  if [[ "$OS" == "mac" ]]; then
+    command -v osascript &>/dev/null && osascript -e "display notification \"${title}\" with title \"m\" sound name \"default\"" 2>/dev/null
+  else
+    command -v notify-send &>/dev/null && notify-send "m" "$title" 2>/dev/null
+  fi
+}
+
+# ── history helpers ───────────────────────────────────────────
+# v5-I — _log_history: rolling dedup — won't log same URL within last 50 entries
+_log_history() {
+  local title="$1" url="$2"
+  [ -z "$url" ] && return
+
+  _notify_track "$title"
+
+  if _lock "$HISTORY_LOCK" 3; then
+    # Dedup: check last 50 entries for this URL
+    local recent_count
+    recent_count=$(tail -50 "$HISTORY_FILE" 2>/dev/null | grep -cF "$url" 2>/dev/null)
+    recent_count="${recent_count:-0}"
+    recent_count=$(echo "$recent_count" | tr -cd '0-9')
+    recent_count="${recent_count:-0}"
+    if [[ "$recent_count" -eq 0 ]]; then
+      printf '%s\t%s\t%s\n' "$(date '+%Y-%m-%d %H:%M')" "$title" "$url" >> "$HISTORY_FILE"
+      local lines; lines=$(wc -l < "$HISTORY_FILE" | tr -d ' ')
+      if [ "$lines" -gt "$HISTORY_MAX" ]; then
+        local tmpf; tmpf=$(mktemp "$HISTORY_FILE.XXXXXX")
+        tail -n "$HISTORY_MAX" "$HISTORY_FILE" > "$tmpf" \
+          && mv "$tmpf" "$HISTORY_FILE" \
+          || rm -f "$tmpf"
+      fi
+    fi
+    _unlock "$HISTORY_LOCK"
+  else
+    # Lock timeout — append without dedup/trim
+    printf '%s\t%s\t%s\n' "$(date '+%Y-%m-%d %H:%M')" "$title" "$url" >> "$HISTORY_FILE"
+  fi
+
+  _scrobble "$title" "$url" &
+  disown $! 2>/dev/null
+}
+
+_scrobble() {
+  [[ -z "${SCROBBLE_URL:-}" ]] && return 0
+  local title="$1" url="$2"
+  command -v curl >/dev/null 2>&1 || return 0
+  local payload
+  payload=$("$JQ" -cn \
+    --arg title "$title" --arg url "$url" --arg ts "$(date +%s)" \
+    '{listen_type:"single",payload:[{listened_at:($ts|tonumber),track_metadata:{track_name:$title,additional_info:{media_player:"m-cli",origin_url:$url}}}]}')
+  curl -s -X POST "$SCROBBLE_URL" \
+    -H "Content-Type: application/json" \
+    -d "$payload" >/dev/null 2>&1 || true
+}
+
+# ── v5-E — _clean_url: handles Shorts, SoundCloud, Bandcamp, local files ─────
+_clean_url() {
+  local url="$1"
+
+  # Don't mangle local file paths
+  [[ "$url" == /* || "$url" == ./* || "$url" == ../* ]] && { echo "$url"; return; }
+  [[ -f "$url" ]] && { echo "$url"; return; }
+
+  local vid=""
+
+  # Standard YouTube watch URL: ?v= or &v=
+  vid=$(printf '%s' "$url" | grep -oE '[?&]v=([A-Za-z0-9_-]{11})' | head -1 | cut -d= -f2)
+
+  # YouTube Shorts: /shorts/ID (v5-E)
+  if [ -z "$vid" ]; then
+    vid=$(printf '%s' "$url" | grep -oE '/shorts/([A-Za-z0-9_-]{11})' | head -1 | grep -oE '[A-Za-z0-9_-]{11}$')
+  fi
+
+  # youtu.be short links
+  if [ -z "$vid" ]; then
+    vid=$(printf '%s' "$url" | grep -oE 'youtu\.be/([A-Za-z0-9_-]{11})' | head -1 \
+          | grep -oE '[A-Za-z0-9_-]{11}$')
+  fi
+
+  # YouTube live streams: /live/ID
+  if [ -z "$vid" ]; then
+    vid=$(printf '%s' "$url" | grep -oE '/live/([A-Za-z0-9_-]{11})' | head -1 | grep -oE '[A-Za-z0-9_-]{11}$')
+  fi
+
+  # If we got a YouTube video ID, normalise to canonical URL
+  [ -n "$vid" ] && { echo "https://www.youtube.com/watch?v=$vid"; return; }
+
+  # Non-YouTube (SoundCloud, Bandcamp, etc.) — return as-is (v5-E)
+  echo "$url"
+}
+
+# ── local file detection ──────────────────────────────────────
+_is_local_file() {
+  local arg="$1"
+  [[ -f "$arg" || "$arg" == /* || "$arg" == ./* || "$arg" == ../* ]] && return 0
+  return 1
+}
+
+# ── queue snapshot ────────────────────────────────────────────
+_queue_snapshot() {
+  [ ! -S "$SOCKET" ] && return
+  local raw; raw=$(_cmd '{"command":["get_property","playlist"]}' 2>/dev/null)
+  [ -z "$raw" ] && return
+  local urls; urls=$(echo "$raw" | "$JQ" -r '.data[].filename // empty' 2>/dev/null)
+  [ -z "$urls" ] && return
+  local tmpf; tmpf=$(mktemp "$DATA_DIR/snap.XXXXXX")
+  echo "$urls" > "$tmpf" && mv "$tmpf" "$QUEUE_SNAPSHOT" || rm -f "$tmpf"
+  # Phase 2.5: auto-save to autosave_queue.m3u when enabled
+  [[ -f "$QUEUE_SAVE_AUTO_FILE" ]] && cp "$QUEUE_SNAPSHOT" "$AUTOSAVE_QUEUE_FILE" 2>/dev/null
+}
+
+# ── Auto-DJ: refill queue from Last.fm when empty (v5-R) ─────────────────────
+_autodj_check() {
+  [[ "$AUTODJ_ENABLED" != "1" ]] && return
+  [[ ! -f "$AUTODJ_FILE" ]] && return
+  [ ! -S "$SOCKET" ] && return
+
+  local pl_count
+  pl_count=$(_cmd '{"command":["get_property","playlist"]}' | "$JQ" '.data|length' 2>/dev/null || echo 0)
+  (( pl_count > 2 )) && return  # queue still has tracks, don't refill
+
+  [ -s "$HISTORY_FILE" ] || return
+  local seed_title; seed_title=$(_tac "$HISTORY_FILE" | awk -F'\t' '!seen[$2]++ {print $2; exit}')
+  [ -z "$seed_title" ] && return
+
+  _info "Auto-DJ: refilling queue based on: $seed_title" >&2
+
+  local similar_title=""
+  if [[ -n "${LASTFM_API_KEY:-}" ]] && command -v curl >/dev/null 2>&1; then
+    local artist track
+    if echo "$seed_title" | grep -q ' - '; then
+      artist=$(echo "$seed_title" | cut -d'-' -f1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+      track=$(echo "$seed_title"  | cut -d'-' -f2- | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    else
+      artist=""; track="$seed_title"
+    fi
+    local enc_artist enc_track
+    enc_artist=$(printf '%s' "$artist" | "$JQ" -Rr '@uri' 2>/dev/null)
+    enc_track=$(printf '%s' "$track" | "$JQ" -Rr '@uri' 2>/dev/null)
+    local lastfm_resp
+    lastfm_resp=$(curl -s --max-time 8 \
+      "https://ws.audioscrobbler.com/2.0/?method=track.getsimilar&artist=${enc_artist}&track=${enc_track}&api_key=${LASTFM_API_KEY}&format=json&limit=10" \
+      2>/dev/null)
+    similar_title=$(echo "$lastfm_resp" | "$JQ" -r \
+      '.similartracks.track[] | "\(.artist.name) - \(.name)"' 2>/dev/null \
+      | grep -v "^null" | head -5 \
+      | awk 'BEGIN{srand()} {a[NR]=$0} END{if(NR>0) print a[int(rand()*NR)+1]}')
+  fi
+
+  local query="${similar_title:-$seed_title}"
+  local results; results=$(_do_search "$query" 3) || return
+  local url; url=$(echo "$results" | head -1 | awk -F ' \| ' '{print $NF}')
+  [ -z "$url" ] && return
+  _ipc_loadfile "$url" "append-play"
+  _info "Auto-DJ: added $(echo "$results" | head -1 | awk -F ' \| ' '{print $1}')" >&2
+}
+
+# ── subcommands ───────────────────────────────────────────────
+
+do_queue_restore() {
+  [ -f "$QUEUE_SNAPSHOT" ] || { _warn "no queue snapshot found — nothing to restore"; return; }
+  local count; count=$(grep -c . "$QUEUE_SNAPSHOT" 2>/dev/null || echo 0)
+  [ "$count" -eq 0 ] && { _warn "queue snapshot is empty"; return; }
+  _start
+  _silent '{"command":["playlist-clear"]}'
+  local loaded=0
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    _ipc_loadfile "$line" "append-play"
+    loaded=$(( loaded + 1 ))
+  done < "$QUEUE_SNAPSHOT"
+  _ok "restored queue: ${loaded} tracks  (use: m now)"
+}
+
+do_play() {
+  _start
+  local url
+
+  if _is_local_file "${1:-}"; then
+    url="$1"
+    [[ -f "$url" ]] || { _err "file not found: $url"; return 1; }
+    _info "loading local file..."
+  else
+    url=$(_pick "${1:-}") || return 1
+  fi
+
+  [ -z "$url" ] && { _warn "cancelled"; return; }
+
+  _silent '{"command":["playlist-clear"]}'
+  _info "buffering..."
+  _ipc_loadfile "$url" "replace"
+
+  # v5-A: _wait_title gives extra time for YouTube URLs (yt-dlp metadata resolution)
+  local title; title=$(_wait_title "$url" 60)
+  _ok "▶  ${title:-unknown}"
+  _log_history "${title:-unknown}" "$(_clean_url "$url")"
+  _queue_snapshot
+  # v5-R: auto-DJ check after play (background, non-blocking)
+  (_autodj_check) &
+  disown $! 2>/dev/null
+}
+
+# do_replay: replay the last played track from history
+do_replay() {
+  [ -s "$HISTORY_FILE" ] || { _warn "history is empty — nothing to replay"; return 1; }
+
+  # Last entry is the most recent: grab its URL (3rd tab-field)
+  local last_url last_title
+  last_url=$(tail -1 "$HISTORY_FILE" | awk -F'\t' '{print $3}')
+  last_title=$(tail -1 "$HISTORY_FILE" | awk -F'\t' '{print $2}')
+
+  [ -z "$last_url" ] && { _warn "could not read last history entry"; return 1; }
+
+  _start
+  _silent '{"command":["playlist-clear"]}'
+  _info "replaying: ${last_title:-$last_url}..."
+  _ipc_loadfile "$last_url" "replace"
+
+  local title; title=$(_wait_title "$last_url" 60)
+  _ok "▶  ${title:-${last_title:-unknown}}"
+  _log_history "${title:-${last_title:-unknown}}" "$(_clean_url "$last_url")"
+  _queue_snapshot
+}
+
+# v5-S — do_add_next: insert track immediately after current position
+do_add_next() {
+  _start
+  local url
+
+  if _is_local_file "${1:-}"; then
+    url="$1"
+    [[ -f "$url" ]] || { _err "file not found: $url"; return 1; }
+  else
+    url=$(_pick "${1:-}") || return 1
+  fi
+
+  [ -z "$url" ] && { _warn "cancelled"; return; }
+
+  # Get current playing index (0-based), insert at current+1
+  local cur_idx; cur_idx=$(_get playlist-playing-pos)
+  cur_idx="${cur_idx:-0}"
+  local insert_pos=$(( cur_idx + 1 ))
+
+  _ipc_loadfile "$url" "append"
+  # Move newly appended track to insert_pos
+  local pl_count
+  pl_count=$(_cmd '{"command":["get_property","playlist"]}' | "$JQ" '.data|length' 2>/dev/null || echo 0)
+  local last_idx=$(( pl_count - 1 ))
+  if (( last_idx > insert_pos )); then
+    _silent "{\"command\":[\"playlist-move\",${last_idx},${insert_pos}]}"
+  fi
+  _ok "➕ added to play next (position $((insert_pos + 1)))"
+  _queue_snapshot
+}
+
+do_add() {
+  _start
+  local url
+
+  if _is_local_file "${1:-}"; then
+    url="$1"
+    [[ -f "$url" ]] || { _err "file not found: $url"; return 1; }
+  else
+    url=$(_pick "${1:-}") || return 1
+  fi
+
+  [ -z "$url" ] && { _warn "cancelled"; return; }
+
+  local existing
+  existing=$(_cmd '{"command":["get_property","playlist"]}' \
+    | "$JQ" -r '.data[].filename' 2>/dev/null | grep -cF "$url" 2>/dev/null || echo 0)
+  if (( existing > 0 )); then
+    _warn "already in queue — use -f to force add"
+    return
+  fi
+
+  _ipc_loadfile "$url" "append-play"
+  _ok "➕ added to queue"
+  _queue_snapshot
+}
+
+do_add_force() {
+  _start
+  local url
+
+  if _is_local_file "${1:-}"; then
+    url="$1"
+    [[ -f "$url" ]] || { _err "file not found: $url"; return 1; }
+  else
+    url=$(_pick "${1:-}") || return 1
+  fi
+
+  [ -z "$url" ] && { _warn "cancelled"; return; }
+  _ipc_loadfile "$url" "append-play"
+  _ok "➕ force-added to queue"
+  _queue_snapshot
+}
+
+do_pause() {
+  _need
+  _silent '{"command":["cycle","pause"]}'
+  local p; p=$(_get pause)
+  [ "$p" = "true" ] && _info "⏸  paused" || _info "▶  resumed"
+}
+
+do_next() {
+  _need
+  _silent '{"command":["playlist-next"]}'
+  local title; title=$(_wait_prop media-title 20)
+  [[ -z "$title" || "$title" == *"watch?v="* ]] && { sleep 1; title=$(_get media-title); }
+  [[ -n "$title" ]] && _notify_track "$title"
+  _ok "⏭  ${title:-end of queue}"
+  (_autodj_check) &
+  disown $! 2>/dev/null
+}
+
+do_prev() {
+  _need
+  _silent '{"command":["playlist-prev"]}'
+  local title; title=$(_wait_prop media-title 20)
+  [[ -n "$title" ]] && _notify_track "$title"
+  _ok "⏮  ${title:-beginning of queue}"
+}
+
+do_stop() {
+  _txt_kill_bg_job
+  _sleep_timer_cancel
+
+  # Persist volume/speed before killing
+  if [[ -S "$SOCKET" ]]; then
+    local v s
+    v=$(_cmd '{"command":["get_property","volume"]}' 2>/dev/null | "$JQ" -r '.data // empty')
+    s=$(_cmd '{"command":["get_property","speed"]}' 2>/dev/null | "$JQ" -r '.data // empty')
+    [[ -n "$v" && -n "$s" ]] && printf 'volume=%s\nspeed=%s\n' "$v" "$s" > "$VOLUME_SPEED_STATE" 2>/dev/null
+  fi
+
+  if [[ -f "$MPV_PID_FILE" ]]; then
+    local pid; pid=$(cat "$MPV_PID_FILE" 2>/dev/null)
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null
+      for i in $(seq 1 20); do
+        sleep 0.1
+        kill -0 "$pid" 2>/dev/null || break
+      done
+      kill -9 "$pid" 2>/dev/null
+    fi
+    rm -f "$MPV_PID_FILE"
+  else
+    pkill -f "input-ipc-server=${SOCKET}" 2>/dev/null
+  fi
+  rm -f "$SOCKET"
+  # Only remove lock if we own it or no lock exists
+  if [[ -f "$LOCK_FILE" ]]; then
+    local lock_pid; lock_pid=$(cat "$LOCK_FILE" 2>/dev/null)
+    [[ "$lock_pid" = "$$" || -z "$lock_pid" ]] && { rm -f "$LOCK_FILE"; rmdir "$LOCK_FILE_D" 2>/dev/null; }
+  else
+    rmdir "$LOCK_FILE_D" 2>/dev/null
+  fi
+  _ok "stopped"
+}
+
+do_start() {
+  _start && _ok "daemon ready"
+}
+
+do_vol() {
+  _need
+  case "${1:-}" in
+    +)
+      _silent "{\"command\":[\"add\",\"volume\",${VOLUME_STEP}]}"
+      local v; v=$(_get volume | awk '{printf "%.0f",$1}')
+      (( v > 150 )) && _silent '{"command":["set_property","volume",150]}'
+      ;;
+    -)
+      _silent "{\"command\":[\"add\",\"volume\",-${VOLUME_STEP}]}"
+      local v; v=$(_get volume | awk '{printf "%.0f",$1}')
+      (( v < 0 )) && _silent '{"command":["set_property","volume",0]}'
+      ;;
+    '')
+      local v; v=$(_get volume)
+      _info "volume: $(echo "$v" | awk '{printf "%.0f%%",$1}')"
+      return
+      ;;
+    *)
+      [[ "${1:-}" =~ ^[0-9]+$ ]] || { _err "usage: m vol [0-150 | + | -]"; return 1; }
+      (( $1 > 150 )) && { _err "max volume is 150"; return 1; }
+      _silent "{\"command\":[\"set_property\",\"volume\",$1]}"
+      ;;
+  esac
+  local v; v=$(_get volume)
+  _info "volume: $(echo "$v" | awk '{printf "%.0f%%",$1}')"
+}
+
+do_seek() {
+  _need
+  [ -z "${1:-}" ] && { _err "usage: m seek [+N | -N | N | MM:SS]"; return 1; }
+  local input="$1"
+  local secs="$input"
+
+  if echo "$input" | grep -qE '^[+-]?[0-9]+:[0-9]{2}$'; then
+    local sign="" ts="$input"
+    [[ "$input" == +* ]] && { sign="+"; ts="${input#+}"; }
+    [[ "$input" == -* ]] && { sign="-"; ts="${input#-}"; }
+    local m s
+    m=$(echo "$ts" | cut -d: -f1 | sed 's/^0*//'); m=${m:-0}
+    s=$(echo "$ts" | cut -d: -f2 | sed 's/^0*//'); s=${s:-0}
+    secs="${sign}$(( m * 60 + s ))"
+  fi
+
+  case "$secs" in
+    +*)
+      local n="${secs#+}"
+      [[ "$n" =~ ^[0-9]+$ ]] || { _err "invalid seek value: $input"; return 1; }
+      _silent "{\"command\":[\"seek\",\"${n}\",\"relative\"]}"
+      ;;
+    -*)
+      local n="${secs#-}"
+      [[ "$n" =~ ^[0-9]+$ ]] || { _err "invalid seek value: $input"; return 1; }
+      _silent "{\"command\":[\"seek\",\"-${n}\",\"relative\"]}"
+      ;;
+    *)
+      [[ "$secs" =~ ^[0-9]+$ ]] || { _err "invalid seek value: $input"; return 1; }
+      _silent "{\"command\":[\"seek\",\"$secs\",\"absolute\"]}"
+      ;;
+  esac
+
+  sleep 0.1
+  local pos; pos=$(_get time-pos)
+  local dur; dur=$(_get duration)
+  pos=$(echo "$pos" | awk '{printf "%d:%02d",$1/60,$1%60}' 2>/dev/null)
+  dur=$(echo "$dur" | awk '{printf "%d:%02d",$1/60,$1%60}' 2>/dev/null)
+
+  # v5: mini progress bar after seek
+  local pos_i dur_i pct bar_fill bar_empty
+  pos_i=$(echo "$pos" | awk -F: '{print $1*60+$2}' 2>/dev/null || echo 0)
+  dur_i=$(echo "$dur" | awk -F: '{print $1*60+$2}' 2>/dev/null || echo 1)
+  (( dur_i < 1 )) && dur_i=1
+  pct=$(( pos_i * 100 / dur_i ))
+  bar_fill=$(printf '%*s' "$(( pct * 20 / 100 ))" '' | tr ' ' '━')
+  bar_empty=$(printf '%*s' "$(( 20 - pct * 20 / 100 ))" '' | tr ' ' '─')
+  _info "⏩ ${pos} / ${dur}  [${bar_fill}${bar_empty}] ${pct}%"
+}
+
+do_speed() {
+  _need
+  case "${1:-}" in
+    +)  _silent '{"command":["multiply","speed",1.1]}' ;;
+    -)  _silent '{"command":["multiply","speed",0.909090909]}' ;;
+    r)  _silent '{"command":["set_property","speed",1.0]}'; _info "speed: 1.0x"; return ;;
+    '')  { _err "usage: m speed [0.25-4.0 | + | - | r]"; return 1; } ;;
+    *)
+      [[ "${1:-}" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { _err "usage: m speed [0.25-4.0 | + | - | r]"; return 1; }
+      (( $(echo "$1 < 0.25" | awk '{print ($1<0.25)?1:0}') )) && { _err "min speed is 0.25"; return 1; }
+      (( $(echo "$1 > 4.0"  | awk '{print ($1>4.0)?1:0}') )) && { _err "max speed is 4.0"; return 1; }
+      _silent "{\"command\":[\"set_property\",\"speed\",$1]}"
+      ;;
+  esac
+  local sp; sp=$(_get speed)
+  _info "speed: $(echo "$sp" | awk '{printf "%.3fx",$1}')"
+}
+
+do_hp() {
+  _need
+  [[ -z "${AUDIO_DEVICE_HEADPHONES:-}" ]] && { _err "headphone device not configured — set AUDIO_DEVICE_HEADPHONES in $CONFIG_FILE"; return 1; }
+  _silent "{\"command\":[\"set_property\",\"audio-device\",\"$AUDIO_DEVICE_HEADPHONES\"]}"
+  _ok "🎧 headphones"
+}
+
+do_sp() {
+  _need
+  [[ -z "${AUDIO_DEVICE_SPEAKERS:-}" ]] && { _err "speaker device not configured — set AUDIO_DEVICE_SPEAKERS in $CONFIG_FILE"; return 1; }
+  _silent "{\"command\":[\"set_property\",\"audio-device\",\"$AUDIO_DEVICE_SPEAKERS\"]}"
+  _ok "🔊 speakers"
+}
+
+do_shuffle() { _need; _silent '{"command":["playlist-shuffle"]}'; _ok "🔀 shuffled"; }
+
+do_repeat() {
+  _need
+  _silent '{"command":["cycle","loop-playlist"]}'
+  local state; state=$(_get loop-playlist)
+  _info "🔁 repeat: ${state}"
+}
+
+do_repeat_one() {
+  _need
+  _silent '{"command":["cycle","loop-file"]}'
+  local state; state=$(_get loop-file)
+  _info "🔂 repeat-one: ${state}"
+}
+
+do_clear() { _need; _silent '{"command":["playlist-clear"]}'; _ok "🗑  queue cleared"; }
+
+do_now() {
+  _need
+  local title pos dur paused speed
+  title=$(_get media-title)
+  [ -z "$title" ] && { _warn "nothing playing"; return; }
+  pos=$(_get time-pos | awk '{printf "%d:%02d",$1/60,$1%60}' 2>/dev/null)
+  dur=$(_get duration   | awk '{printf "%d:%02d",$1/60,$1%60}' 2>/dev/null)
+  paused=$(_get pause)
+  speed=$(_get speed | awk '{printf "%.2f",$1}')
+  local icon="▶"; [ "$paused" = "true" ] && icon="⏸"
+  local pl_pos; pl_pos=$(_get playlist-playing-pos)
+  local pl_count; pl_count=$(_cmd '{"command":["get_property","playlist"]}' | "$JQ" '.data|length' 2>/dev/null)
+  echo ""
+  echo "  ${icon}  ${Y}${title}${X}"
+  echo "  ${W}${pos}${X} / ${W}${dur}${X}   speed: ${speed}x   queue: $((pl_pos+1))/${pl_count:-?}"
+  echo ""
+}
+
+# v5-F + v5-K — do_bar: cursor always restored; single jq pass per frame
+do_bar() {
+  _need
+  local title; title=$(_get media-title)
+  [ -z "$title" ] && { _warn "nothing playing"; return; }
+
+  tput civis 2>/dev/null
+
+  local _m_bar_cleanup_done=0
+  _m_bar_cleanup() {
+    if [[ $_m_bar_cleanup_done -eq 0 ]]; then
+      _m_bar_cleanup_done=1
+      printf '\n\n\n'
+      tput cnorm 2>/dev/null
+    fi
+  }
+  trap '_m_bar_cleanup' INT TERM EXIT
+
+  local tw; tw=$(tput cols 2>/dev/null || echo 80)
+  local bar_w=$(( tw - 24 ))
+  (( bar_w < 10 )) && bar_w=10
+
+  while true; do
+    # v5-K — _get_multi uses individual _get calls (get_property_list is invalid mpv IPC)
+    local raw_props
+    raw_props=$(_get_multi time-pos duration pause speed media-title loop-playlist loop-file volume playlist-playing-pos 2>/dev/null)
+
+    local pos dur paused speed title2 repeat loop_one vol pl_pos
+    if echo "$raw_props" | "$JQ" -e 'type == "object"' >/dev/null 2>&1; then
+      local parsed
+      parsed=$(echo "$raw_props" | "$JQ" -r '
+        [
+          (.["time-pos"]          // ""),
+          (.["duration"]          // ""),
+          (.["pause"]             // "false"),
+          (.["speed"]             // "1"),
+          (.["media-title"]       // ""),
+          (.["loop-playlist"]     // "no"),
+          (.["loop-file"]         // "no"),
+          (.["volume"]            // "80"),
+          (.["playlist-playing-pos"] // "0")
+        ] | @tsv' 2>/dev/null)
+      IFS=$'\t' read -r pos dur paused speed title2 repeat loop_one vol pl_pos <<< "$parsed"
+    else
+      pos=$(_get time-pos); dur=$(_get duration); paused=$(_get pause)
+      speed=$(_get speed); title2=$(_get media-title); repeat=$(_get loop-playlist)
+      loop_one=$(_get loop-file); vol=$(_get volume | awk '{printf "%.0f",$1}')
+    fi
+
+    speed=$(echo "$speed" | awk '{printf "%.2f",$1}')
+    vol=$(echo "$vol" | awk '{printf "%.0f",$1}')
+
+    # v5-F: break on empty pos/dur, but cleanup runs after loop (not just trap)
+    [ -z "$pos" ] || [ -z "$dur" ] && break
+
+    local pos_i dur_i
+    pos_i=$(printf '%.0f' "$pos" 2>/dev/null || echo 0)
+    dur_i=$(printf '%.0f' "$dur" 2>/dev/null || echo 1)
+    (( dur_i < 1 )) && dur_i=1
+
+    local pct=$(( pos_i * 100 / dur_i ))
+    local filled=$(( pos_i * bar_w / dur_i ))
+    local empty=$(( bar_w - filled ))
+    (( filled < 0 )) && filled=0
+    (( empty  < 0 )) && empty=0
+
+    local pos_fmt; pos_fmt=$(awk "BEGIN{printf \"%d:%02d\", $pos_i/60, $pos_i%60}")
+    local dur_fmt; dur_fmt=$(awk "BEGIN{printf \"%d:%02d\", $dur_i/60, $dur_i%60}")
+    local rem_i=$(( dur_i - pos_i ))
+    local rem_fmt; rem_fmt=$(awk "BEGIN{printf \"-%d:%02d\", $rem_i/60, $rem_i%60}")
+
+    local icon="▶"; [ "$paused" = "true" ] && icon="⏸"
+    local rep_icon=""
+    [[ "$loop_one" != "no" && -n "$loop_one" ]] && rep_icon=" 🔂"
+    [[ "$repeat"   != "no" && -n "$repeat"   ]] && rep_icon=" 🔁"
+
+    local bar_filled bar_empty
+    bar_filled=$(printf '%*s' "$filled" '' | tr ' ' '━')
+    bar_empty=$(printf '%*s'  "$empty"  '' | tr ' ' '─')
+
+    printf '\r\e[2K'
+    printf "\e[0;36m  ${icon}  \e[1;37m%.${tw}s\e[0m" "${title2}${rep_icon}"
+    printf '\n\r\e[2K'
+    printf "  \e[0;36m%s\e[0m\e[2m%s\e[0m  \e[0;33m%s\e[0m / \e[0;37m%s\e[0m  \e[2m(%s)\e[0m" \
+      "$bar_filled" "$bar_empty" "$pos_fmt" "$dur_fmt" "$rem_fmt"
+    printf '\n\r\e[2K'
+    printf "  \e[2mspd:%sx  vol:%s%%  %d%%  p=pause  n/b=skip  ,/.=seek  +/-=vol  r=rpt  l=lyrics  q=quit\e[0m" \
+      "$speed" "$vol" "$pct"
+    printf '\e[2A'
+
+    local key
+    if read -r -s -k1 -t 0.5 key 2>/dev/null; then
+      case "$key" in
+        q|Q|$'\e') break ;;
+        p) _silent '{"command":["cycle","pause"]}' ;;
+        n) _silent '{"command":["playlist-next"]}'; sleep 0.4; (_autodj_check) & disown $! 2>/dev/null ;;
+        b) _silent '{"command":["playlist-prev"]}'; sleep 0.4 ;;
+        .) _silent '{"command":["seek","10","relative"]}' ;;
+        ,) _silent '{"command":["seek","-10","relative"]}' ;;
+        +) _silent "{\"command\":[\"add\",\"volume\",${VOLUME_STEP}]}" ;;
+        -) _silent "{\"command\":[\"add\",\"volume\",-${VOLUME_STEP}]}" ;;
+        r) _silent '{"command":["cycle","loop-playlist"]}' ;;
+        1) _silent '{"command":["cycle","loop-file"]}' ;;
+        l) printf '\n\n\n'; tput cnorm 2>/dev/null; _m_bar_cleanup_done=1; do_lyrics; return ;;
+      esac
+    fi
+  done
+
+  # v5-F: always cleanup after loop exit, not just on signal
+  _m_bar_cleanup
+  trap - INT TERM EXIT
+}
+
+do_scrub() {
+  _need
+  local title pos dur
+  title=$(_get media-title)
+  [ -z "$title" ] && { _warn "nothing playing"; return; }
+  dur=$(_get duration)
+  pos=$(_get time-pos)
+  [ -z "$dur" ] && { _warn "duration unavailable (still buffering?)"; return; }
+
+  local dur_i; dur_i=$(printf '%.0f' "$dur")
+  local pos_i; pos_i=$(printf '%.0f' "${pos:-0}")
+  (( dur_i < 1 )) && { _warn "track too short to scrub"; return; }
+
+  local step=5
+  (( dur_i / step > 500 )) && step=$(( dur_i / 500 + 1 ))
+
+  local lines=()
+  local t=0
+  while (( t <= dur_i )); do
+    local mm ss pct bar_fill bar_empty filled_w empty_w
+    mm=$(( t / 60 )); ss=$(( t % 60 ))
+    pct=$(( t * 100 / dur_i ))
+    filled_w=$(( pct * 30 / 100 ))
+    empty_w=$(( 30 - filled_w ))
+    bar_fill=$(printf '%*s' "$filled_w" '' | tr ' ' '█')
+    bar_empty=$(printf '%*s' "$empty_w" '' | tr ' ' '░')
+    local marker="  "
+    (( t >= pos_i - step/2 && t <= pos_i + step/2 )) && marker="▶ "
+    lines+=("$(printf '%s%02d:%02d  [%s%s]  %3d%%' "$marker" "$mm" "$ss" "$bar_fill" "$bar_empty" "$pct")")
+    t=$(( t + step ))
+  done
+
+  local chosen
+  chosen=$(printf '%s\n' "${lines[@]}" | "$FZF" \
+    --height 70% --reverse \
+    --prompt "⏱  scrub > " \
+    --header "▶ marks current pos · ENTER to jump · ESC cancel" \
+    --no-sort)
+
+  [ -z "$chosen" ] && { _warn "cancelled"; return; }
+
+  local ts; ts=$(echo "$chosen" | grep -oE '[0-9]+:[0-9]{2}' | head -1)
+  [ -z "$ts" ] && { _err "could not parse timestamp"; return 1; }
+
+  local m s target_secs
+  m=$(echo "$ts" | cut -d: -f1 | sed 's/^0*//'); m=${m:-0}
+  s=$(echo "$ts" | cut -d: -f2 | sed 's/^0*//'); s=${s:-0}
+  target_secs=$(( m * 60 + s ))
+
+  _silent "{\"command\":[\"seek\",\"$target_secs\",\"absolute\"]}"
+  sleep 0.1
+  local new_pos; new_pos=$(_get time-pos | awk '{printf "%d:%02d",$1/60,$1%60}')
+  _ok "jumped to ${new_pos}  /  $(awk "BEGIN{printf \"%d:%02d\",$dur_i/60,$dur_i%60}")"
+}
+
+do_queue() {
+  _need
+  local pl current_idx n
+  pl=$(_cmd '{"command":["get_property","playlist"]}')
+  n=$(echo "$pl" | "$JQ" '.data|length' 2>/dev/null)
+  current_idx=$(_get playlist-playing-pos)
+  [ -z "$n" ] || [ "$n" = "0" ] && { _warn "queue empty"; return; }
+  echo ""
+  echo "  ${C}queue — ${n} tracks${X}"
+  echo ""
+  echo "$pl" | "$JQ" -r '.data | to_entries[] | [(.key|tostring), (.value.title // .value.filename)] | @tsv' 2>/dev/null \
+    | while IFS=$'\t' read -r idx title; do
+        if [ "$idx" = "$current_idx" ]; then
+          echo "  ${G}▶ $((idx+1)). ${title}${X}"
+        else
+          echo "    $((idx+1)). ${title}"
+        fi
+      done
+  echo ""
+}
+
+do_queue_move() {
+  _need
+  [[ -z "${1:-}" || -z "${2:-}" ]] && { _err "usage: m qmove <from_pos> <to_pos>  (1-based)"; return 1; }
+  local from=$(( $1 - 1 )) to=$(( $2 - 1 ))
+  _silent "{\"command\":[\"playlist-move\",${from},${to}]}"
+  _ok "moved track $1 → position $2"
+}
+
+do_queue_remove() {
+  _need
+  [[ -z "${1:-}" ]] && { _err "usage: m qrm <pos>  (1-based)"; return 1; }
+  local pos=$(( $1 - 1 ))
+  _silent "{\"command\":[\"playlist-remove\",${pos}]}"
+  _ok "removed track $1 from queue"
+}
+
+do_status() {
+  if [ ! -S "$SOCKET" ]; then
+    echo ""
+    echo "  ┌─────────────────────────────────────┐"
+    echo "  │  ${R}● stopped${X}                        │"
+    echo "  │  run: m start                        │"
+    echo "  └─────────────────────────────────────┘"
+    echo ""
+    return
+  fi
+  local title paused vol speed
+  title=$(_get media-title)
+  paused=$(_get pause)
+  vol=$(_get volume | awk '{printf "%.0f",$1}')
+  speed=$(_get speed | awk '{printf "%.2f",$1}')
+  local pl_count
+  pl_count=$(_cmd '{"command":["get_property","playlist"]}' | "$JQ" '.data|length' 2>/dev/null)
+  local repeat; repeat=$(_get loop-playlist)
+  local loop_one; loop_one=$(_get loop-file)
+  echo ""
+  echo "  ┌─────────────────────────────────────────────────────────────┐"
+  printf "  │  ${G}● running${X}   vol: %3s%%   speed: %sx   queue: %s tracks      │\n" "$vol" "$speed" "${pl_count:-0}"
+  echo "  ├─────────────────────────────────────────────────────────────┤"
+
+  _txt_state_read
+  if [ -n "$TXT_ACTIVE_FILE" ]; then
+    _txt_read_lines "$TXT_ACTIVE_FILE"
+    printf "  │  ${C}txt:${X} %-20s  [%s/%s]                      │\n" "$(basename "$TXT_ACTIVE_FILE" .txt)" \
+      "$(( TXT_ACTIVE_IDX + 1))" "${#TXT_LINES[@]}"
+  fi
+
+  local timer_file="$DATA_DIR/sleep_timer_pid"
+  if [[ -f "$timer_file" ]]; then
+    local tpid; tpid=$(cat "$timer_file" 2>/dev/null)
+    [[ -n "$tpid" ]] && kill -0 "$tpid" 2>/dev/null && printf "  │  ${Y}⏲  sleep timer active${X}                                  │\n"
+  fi
+
+  [[ -f "$AUTODJ_FILE" ]] && printf "  │  ${M}🤖 Auto-DJ active${X}                                        │\n"
+  [[ "$repeat"   != "no" && -n "$repeat"   ]] && printf "  │  ${Y}🔁 repeat-playlist${X}                                    │\n"
+  [[ "$loop_one" != "no" && -n "$loop_one" ]] && printf "  │  ${Y}🔂 repeat-one${X}                                         │\n"
+  echo "  ├─────────────────────────────────────────────────────────────┤"
+  if [ -n "$title" ]; then
+    local pos dur
+    pos=$(_get time-pos | awk '{printf "%d:%02d",$1/60,$1%60}' 2>/dev/null)
+    dur=$(_get duration   | awk '{printf "%d:%02d",$1/60,$1%60}' 2>/dev/null)
+    local icon="▶"; [ "$paused" = "true" ] && icon="⏸"
+    local t="${title:0:45}"
+    printf "  │  %s %-45s %s/%s │\n" "$icon" "$t" "$pos" "$dur"
+  else
+    printf "  │  ${W}idle — m \"song name\" to play${X}                          │\n"
+  fi
+  echo "  └─────────────────────────────────────────────────────────────┘"
+  echo ""
+}
+
+# ── like / love ───────────────────────────────────────────────
+do_like() {
+  _need
+  local title url clean
+  title=$(_get media-title)
+  url=$(_get path)
+  [ -z "$url" ] && { _warn "nothing playing"; return; }
+  clean=$(_clean_url "$url")
+  if grep -qF "$clean" "$LIKES_FILE" 2>/dev/null; then
+    _warn "already liked: $title"
+    return
+  fi
+  printf '%s\t%s\t%s\n' "$(date '+%Y-%m-%d %H:%M')" "$title" "$clean" >> "$LIKES_FILE"
+  _ok "❤  liked: ${title}"
+}
+
+do_unlike() {
+  [ -s "$LIKES_FILE" ] || { _warn "no likes yet"; return; }
+  local line
+  line=$("$FZF" \
+    --height 50% --reverse \
+    --prompt "💔 unlike > " \
+    --header "ENTER to remove · ESC cancel" \
+    --with-nth=2 --delimiter=$'\t' < "$LIKES_FILE")
+  [ -z "$line" ] && { _warn "cancelled"; return; }
+  local tmpf; tmpf=$(mktemp "$LIKES_FILE.XXXXXX")
+  grep -vF "$line" "$LIKES_FILE" > "$tmpf" && mv "$tmpf" "$LIKES_FILE" || rm -f "$tmpf"
+  _ok "removed from likes"
+}
+
+do_likes() {
+  [ -s "$LIKES_FILE" ] || { _warn "no likes yet — use: m like"; return; }
+  echo ""
+  echo "  ${M}❤  liked tracks${X}"
+  echo ""
+  awk -F'\t' '{print NR". "$2}' "$LIKES_FILE" | sed 's/^/  /'
+  echo ""
+}
+
+do_love() {
+  _need
+  [ -s "$LIKES_FILE" ] || { _warn "no likes yet — use: m like while playing"; return; }
+  local line; line=$(_shuf1 "$LIKES_FILE")
+  [ -z "$line" ] && { _warn "likes file empty"; return; }
+  local url title
+  url=$(printf '%s' "$line" | awk -F'\t' '{print $3}')
+  title=$(printf '%s' "$line" | awk -F'\t' '{print $2}')
+  _start
+  _silent '{"command":["playlist-clear"]}'
+  _ipc_loadfile "$url" "replace"
+  local actual_title; actual_title=$(_wait_title "$url" 30)
+  _ok "❤  ▶  ${actual_title:-$title}"
+}
+
+do_likes_play() {
+  _need
+  [ -s "$LIKES_FILE" ] || { _warn "no likes yet"; return; }
+  local line
+  line=$("$FZF" \
+    --height 50% --reverse \
+    --prompt "❤ play liked > " \
+    --header "ENTER play · ESC cancel" \
+    --with-nth=2 --delimiter=$'\t' < "$LIKES_FILE")
+  [ -z "$line" ] && { _warn "cancelled"; return; }
+  local url; url=$(printf '%s' "$line" | awk -F'\t' '{print $3}')
+  _silent '{"command":["playlist-clear"]}'
+  _ipc_loadfile "$url" "replace"
+  local actual_title; actual_title=$(_wait_title "$url" 30)
+  _ok "▶  ${actual_title:-playing}"
+}
+
+# ── history ───────────────────────────────────────────────────
+do_history() {
+  [ -s "$HISTORY_FILE" ] || { _warn "no history yet"; return; }
+  local line url
+  line=$(_tac "$HISTORY_FILE" | "$FZF" \
+    --height 60% --reverse \
+    --prompt "🕑 history > " \
+    --header "ENTER replay · ESC cancel" \
+    --with-nth=1,2 --delimiter=$'\t' \
+    --preview 'echo {} | awk -F"\t" "{printf \"Date:  %s\nTitle: %s\nURL:   %s\n\",\$1,\$2,\$3}"' \
+    --preview-window=down:3:wrap)
+  [ -z "$line" ] && { _warn "cancelled"; return; }
+  url=$(printf '%s' "$line" | awk -F'\t' '{print $3}')
+  [ -z "$url" ] && { _err "could not extract URL from history entry"; return 1; }
+  _start
+  _silent '{"command":["playlist-clear"]}'
+  _ipc_loadfile "$url" "replace"
+  local title; title=$(_wait_title "$url" 30)
+  _ok "▶  ${title:-playing}"
+}
+
+do_history_clear() {
+  printf "${Y}Clear all history? [y/N] ${X}"
+  read -r ans
+  [[ "$ans" =~ ^[Yy]$ ]] || { _warn "cancelled"; return; }
+  > "$HISTORY_FILE"
+  _ok "history cleared"
+}
+
+# ── playlists ─────────────────────────────────────────────────
+do_save() {
+  _need
+  [ -z "${1:-}" ] && { _err "usage: m save <n>"; return 1; }
+  local name="$1"
+  name=$(printf '%s' "$name" | tr ' ' '_' | tr -cd '[:alnum:]_-')
+  [ -z "$name" ] && { _err "invalid playlist name"; return 1; }
+  local file="$PLAYLIST_DIR/${name}.m3u"
+  local tmpf; tmpf=$(mktemp "$PLAYLIST_DIR/${name}.XXXXXX")
+  local count=0
+  local raw_playlist; raw_playlist=$(_cmd '{"command":["get_property","playlist"]}')
+  local urls; urls=$(echo "$raw_playlist" | "$JQ" -r '.data[].filename' 2>/dev/null)
+  if [[ -z "$urls" ]]; then
+    rm -f "$tmpf"; _err "queue is empty — nothing to save"; return 1
+  fi
+  while IFS= read -r url; do
+    [ -z "$url" ] && continue
+    printf '%s\n' "$(_clean_url "$url")" >> "$tmpf"
+    count=$(( count + 1 ))
+  done <<< "$urls"
+  if [[ $count -eq 0 ]]; then
+    rm -f "$tmpf"; _err "queue is empty — nothing to save"; return 1
+  fi
+  mv "$tmpf" "$file"
+  _ok "saved: ${name}  (${count} tracks)"
+}
+
+do_load() {
+  [ -z "${1:-}" ] && { _err "usage: m load <n>"; return 1; }
+  local f="$PLAYLIST_DIR/${1}.m3u"
+  [ -f "$f" ] || { _err "playlist not found: $1"; return 1; }
+  _start
+  _silent '{"command":["playlist-clear"]}'
+  local _existing_urls
+  _existing_urls=$(_cmd '{"command":["get_property","playlist"]}' \
+    | "$JQ" -r '.data[].filename // empty' 2>/dev/null || echo "")
+  local count=0
+  while IFS= read -r line; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    if echo "$_existing_urls" | grep -qF "$line" 2>/dev/null; then
+      _warn "skipping duplicate: $(basename "$line")"
+      continue
+    fi
+    _ipc_loadfile "$line" "append-play"
+    _existing_urls="${_existing_urls}"$'\n'"${line}"
+    count=$(( count + 1 ))
+  done < "$f"
+  _ok "loaded: $1  (${count} tracks)"
+  _info "first track buffering... use: m now"
+  _queue_snapshot
+}
+
+do_playlists() {
+  echo ""
+  echo "  ${C}saved playlists:${X}"
+  local found=0
+  for f in "$PLAYLIST_DIR"/*.m3u(N); do
+    local name; name=$(basename "$f" .m3u)
+    local count; count=$(grep -cvE '^\s*(#|$)' "$f" 2>/dev/null || echo 0)
+    echo "  ∙ ${W}${name}${X}  (${count} tracks)"
+    found=1
+  done
+  [ $found -eq 0 ] && echo "  (none yet — use: m save <n>)"
+  echo ""
+}
+
+do_playlist_del() {
+  [ -z "${1:-}" ] && { _err "usage: m pldel <n>"; return 1; }
+  local f="$PLAYLIST_DIR/${1}.m3u"
+  [ -f "$f" ] || { _err "not found: $1"; return 1; }
+  printf "${Y}Delete playlist '%s'? [y/N] ${X}" "$1"
+  read -r ans
+  [[ "$ans" =~ ^[Yy]$ ]] || { _warn "cancelled"; return; }
+  rm "$f"
+  _ok "deleted playlist: $1"
+}
+
+# ── download ──────────────────────────────────────────────────
+do_dl() {
+  [ -z "${1:-}" ] && { _err "usage: m dl \"song query\""; return 1; }
+  _info "searching to download..."
+  local url; url=$(_pick "$1") || return 1
+  [ -z "$url" ] && { _warn "cancelled"; return; }
+  _info "downloading to $DOWNLOADS_DIR ..."
+  echo ""
+  "$YTDLP" "$url" \
+    --extract-audio \
+    --audio-format mp3 \
+    --audio-quality 0 \
+    --embed-thumbnail \
+    --add-metadata \
+    --embed-metadata \
+    --output "$DOWNLOADS_DIR/%(title)s.%(ext)s" \
+    --no-playlist \
+    --progress \
+    --console-title=no \
+    --no-warnings
+  local rc=$?
+  echo ""
+  if [[ $rc -ne 0 ]]; then
+    _err "download failed (yt-dlp exit $rc) — check: m log"
+    return 1
+  fi
+  _ok "download complete → $DOWNLOADS_DIR"
+}
+
+do_dl_list() {
+  echo ""
+  echo "  ${C}downloads:${X}  $DOWNLOADS_DIR"
+  echo ""
+  local found=0
+  for f in "$DOWNLOADS_DIR"/*.mp3(N) "$DOWNLOADS_DIR"/*.m4a(N) "$DOWNLOADS_DIR"/*.opus(N); do
+    echo "  ∙ $(basename "$f")"
+    found=1
+  done
+  [[ $found -eq 0 ]] && echo "  (none yet — use: m dl \"song name\")"
+  echo ""
+}
+
+# ── import YouTube playlist ───────────────────────────────────
+do_import() {
+  [ -z "${1:-}" ] && { _err "usage: m import \"https://youtube.com/playlist?list=...\""; return 1; }
+  _info "fetching playlist metadata (this may take a moment)..."
+  local tmpf; tmpf=$(mktemp "$PLAYLIST_DIR/import.XXXXXX")
+  "$YTDLP" "$1" \
+    --flat-playlist \
+    --print "%(webpage_url)s" \
+    --no-warnings 2>/dev/null > "$tmpf"
+  local count; count=$(wc -l < "$tmpf" | tr -d ' ')
+  if [[ $count -eq 0 ]]; then
+    rm -f "$tmpf"
+    _err "no tracks found — is the URL correct and the playlist public?"
+    return 1
+  fi
+  printf "${C}Save as playlist name: ${X}"
+  read -r pname
+  pname=$(printf '%s' "$pname" | tr ' ' '_' | tr -cd '[:alnum:]_-')
+  [ -z "$pname" ] && { rm -f "$tmpf"; _err "invalid name"; return 1; }
+  if [[ -f "$PLAYLIST_DIR/${pname}.m3u" ]]; then
+    local existing_count; existing_count=$(grep -cvE '^\s*(#|$)' "$PLAYLIST_DIR/${pname}.m3u" 2>/dev/null || echo 0)
+    printf "${Y}Playlist '%s' already exists (%s tracks). Overwrite? [y/N] ${X}" "$pname" "$existing_count"
+    local ans; read -r ans
+    if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+      rm -f "$tmpf"; _warn "import cancelled"; return 1
+    fi
+  fi
+  mv "$tmpf" "$PLAYLIST_DIR/${pname}.m3u"
+  _ok "imported: ${pname}  (${count} tracks)  →  m load ${pname}"
+}
+
+# ── v5-P — Real-time synced lyrics from lrclib.net ─────────────────────────
+_lyrics_clean_title() {
+  local t="$1"
+  # Strip common YouTube suffixes (parenthetical and bracketed)
+  t=$(printf '%s' "$t" | sed -E '
+    s/\(Official[^)]*\)//gi
+    s/\(Lyrics[^)]*\)//gi
+    s/\(Audio[^)]*\)//gi
+    s/\(Video[^)]*\)//gi
+    s/\(Visuali[sz]er[^)]*\)//gi
+    s/\(Full Song[^)]*\)//gi
+    s/\(HD[^)]*\)//gi
+    s/\(HQ[^)]*\)//gi
+    s/\[Official[^]]*\]//gi
+    s/\[Lyrics[^]]*\]//gi
+    s/\[Audio[^]]*\]//gi
+    s/\[Video[^]]*\]//gi
+    s/\[HD[^]]*\]//gi
+    s/\[HQ[^]]*\]//gi
+  ')
+  # Replace underscores with spaces (common in Bollywood YouTube titles)
+  t=$(printf '%s' "$t" | tr '_' ' ')
+  # Remove year patterns like (1971) or standalone 4-digit years
+  t=$(printf '%s' "$t" | sed -E 's/\([0-9]{4}\)//g; s/\b(19|20)[0-9]{2}\b//g')
+  # Remove common metadata markers: &-separated names, pipe-separated info
+  t=$(printf '%s' "$t" | sed -E 's/\|.*//; s/\#[^ ]*//g')
+  # Remove "a trib..." (tribute) or "full movie" trailers
+  t=$(printf '%s' "$t" | sed -E 's/\ba trib[a-z]*\b.*//i; s/\bfull movie\b.*//i; s/\bfull song\b.*//i')
+  # Collapse multiple spaces, trim
+  t=$(printf '%s' "$t" | sed -E 's/  +/ /g; s/^ +//; s/ +$//')
+  printf '%s' "$t"
+}
+
+_LYRICS_LRC=""
+_LYRICS_HAS_SYNC=0
+
+_lyrics_try_fetch() {
+  # Sets _LYRICS_LRC and _LYRICS_HAS_SYNC on success, returns 0.
+  # Does NOT use $() capture — avoids zsh local-leak bug.
+  _LYRICS_LRC=""
+  _LYRICS_HAS_SYNC=0
+  local _ltf_query="$1" _ltf_artist="${2:-}"
+  local _ltf_enc_q _ltf_enc_a _ltf_url _ltf_resp _ltf_synced _ltf_plain
+
+  _ltf_enc_q=$(printf '%s' "$_ltf_query" | "$JQ" -Rr '@uri' 2>/dev/null)
+  [[ -z "$_ltf_enc_q" ]] && return 1
+
+  _ltf_url="https://lrclib.net/api/search?q=${_ltf_enc_q}"
+  if [[ -n "$_ltf_artist" ]]; then
+    _ltf_enc_a=$(printf '%s' "$_ltf_artist" | "$JQ" -Rr '@uri' 2>/dev/null)
+    _ltf_url="${_ltf_url}&artist_name=${_ltf_enc_a}"
+  fi
+
+  _ltf_resp=$("$CURL" -sf --max-time 8 "$_ltf_url" 2>/dev/null) || return 1
+  [[ -z "$_ltf_resp" ]] && return 1
+
+  _ltf_synced=$(printf '%s' "$_ltf_resp" | "$JQ" -r '.[0].syncedLyrics // empty' 2>/dev/null)
+  if [[ -n "$_ltf_synced" ]]; then
+    _LYRICS_LRC="$_ltf_synced"
+    _LYRICS_HAS_SYNC=1
+    return 0
+  fi
+
+  _ltf_plain=$(printf '%s' "$_ltf_resp" | "$JQ" -r '.[0].plainLyrics // empty' 2>/dev/null)
+  if [[ -n "$_ltf_plain" ]]; then
+    _LYRICS_LRC="$_ltf_plain"
+    _LYRICS_HAS_SYNC=0
+    return 0
+  fi
+
+  # Also try lrclib direct-get endpoint (exact match, more reliable)
+  if [[ -n "$_ltf_artist" ]]; then
+    _ltf_enc_a=$(printf '%s' "$_ltf_artist" | "$JQ" -Rr '@uri' 2>/dev/null)
+    local _ltf_get_url="https://lrclib.net/api/get?artist_name=${_ltf_enc_a}&track_name=${_ltf_enc_q}"
+    _ltf_resp=$("$CURL" -sf --max-time 8 "$_ltf_get_url" 2>/dev/null) || return 1
+    [[ -z "$_ltf_resp" ]] && return 1
+
+    _ltf_synced=$(printf '%s' "$_ltf_resp" | "$JQ" -r '.syncedLyrics // empty' 2>/dev/null)
+    if [[ -n "$_ltf_synced" ]]; then
+      _LYRICS_LRC="$_ltf_synced"
+      _LYRICS_HAS_SYNC=1
+      return 0
+    fi
+    _ltf_plain=$(printf '%s' "$_ltf_resp" | "$JQ" -r '.plainLyrics // empty' 2>/dev/null)
+    if [[ -n "$_ltf_plain" ]]; then
+      _LYRICS_LRC="$_ltf_plain"
+      _LYRICS_HAS_SYNC=0
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+do_lyrics() {
+  _need
+  [[ -z "$CURL" || ! -x "$CURL" ]] && { _err "curl required for lyrics"; return 1; }
+  [[ "$LYRICS_ENABLED" != "1" ]] && { _warn "lyrics disabled — set LYRICS_ENABLED=1 in config"; return; }
+
+  local title; title=$(_get media-title)
+  [ -z "$title" ] && { _warn "nothing playing"; return; }
+
+  _info "fetching lyrics for: $title"
+
+  # Clean the title aggressively for lyrics search
+  local cleaned; cleaned=$(_lyrics_clean_title "$title")
+
+  # Try to split "Artist - Title" format
+  local artist="" track="$cleaned"
+  if echo "$cleaned" | grep -q ' - '; then
+    artist=$(echo "$cleaned" | cut -d'-' -f1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    track=$(echo "$cleaned"  | cut -d'-' -f2- | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  fi
+
+  # Multi-attempt search using global _LYRICS_LRC / _LYRICS_HAS_SYNC
+  # (avoids calling functions inside $() which causes zsh local-leak)
+  local lrc="" has_sync=0 found=0
+
+  # Attempt 1: cleaned track + artist
+  if _lyrics_try_fetch "$track" "$artist"; then
+    found=1
+  fi
+  # Attempt 2: full cleaned title (no artist split)
+  if [[ $found -eq 0 ]]; then
+    if _lyrics_try_fetch "$cleaned" ""; then found=1; fi
+  fi
+  # Attempt 3: first few words only (strip trailing metadata)
+  if [[ $found -eq 0 ]]; then
+    local short; short=$(printf '%s' "$cleaned" | awk '{for(i=1;i<=NF&&i<=8;i++) printf "%s ", $i}' | sed 's/ *$//')
+    if [[ "$short" != "$cleaned" && -n "$short" ]]; then
+      _info "retrying with: $short"
+      if _lyrics_try_fetch "$short" ""; then found=1; fi
+    fi
+  fi
+  # Attempt 4: original title as last resort
+  if [[ $found -eq 0 && "$cleaned" != "$title" ]]; then
+    if _lyrics_try_fetch "$title" ""; then found=1; fi
+  fi
+
+  if [[ $found -eq 0 ]]; then
+    _warn "no lyrics found for: $cleaned"
+    _info "tip: YouTube titles with heavy metadata may not match lyrics databases"
+    return
+  fi
+
+  lrc="$_LYRICS_LRC"
+  has_sync=$_LYRICS_HAS_SYNC
+
+  if [[ "$has_sync" -eq 0 ]]; then
+    # Plain lyrics — just display with pager
+    echo ""
+    echo "  ${C}Lyrics: ${title}${X}  ${DIM}(plain — no sync)${X}"
+    echo ""
+    echo "$lrc" | sed 's/^/  /'
+    echo ""
+    return
+  fi
+
+  # Synced lyrics: parse LRC format [MM:SS.xx] line
+  # Display with real-time highlighting based on mpv time-pos
+  tput civis 2>/dev/null
+  local cleanup_done=0
+  _lyrics_cleanup() {
+    [[ $cleanup_done -eq 0 ]] && { cleanup_done=1; tput cnorm 2>/dev/null; printf '\n'; }
+  }
+  trap '_lyrics_cleanup' INT TERM EXIT
+
+  echo ""
+  echo "  ${C}♪ ${title}${X}  ${DIM}(synced — q to exit)${X}"
+  echo ""
+
+  # Parse LRC into arrays: timestamps (seconds) and lines
+  local -a lrc_times lrc_lines
+  local prev_line
+  while IFS= read -r line; do
+    if echo "$line" | grep -qE '^\[[0-9]+:[0-9]+\.[0-9]+\]'; then
+      local ts; ts=$(echo "$line" | grep -oE '^\[[0-9]+:[0-9]+\.[0-9]+\]' | tr -d '[]')
+      local mm ss
+      mm=$(echo "$ts" | cut -d: -f1 | sed 's/^0*//' ); mm=${mm:-0}
+      ss=$(echo "$ts" | cut -d: -f2)
+      local total_s; total_s=$(awk "BEGIN{printf \"%d\", $mm*60+$ss}")
+      local ltext; ltext=$(echo "$line" | sed 's/^\[[^]]*\]//' | sed 's/^[[:space:]]*//')
+      lrc_times+=("$total_s")
+      lrc_lines+=("$ltext")
+    fi
+  done <<< "$lrc"
+
+  local total=${#lrc_times[@]}
+  (( total == 0 )) && { _warn "could not parse synced lyrics"; tput cnorm 2>/dev/null; return; }
+
+  local last_idx=-1
+  local tw; tw=$(tput cols 2>/dev/null || echo 80)
+
+  while true; do
+    local pos; pos=$(_get time-pos 2>/dev/null)
+    [[ -z "$pos" ]] && break
+    local pos_i; pos_i=$(printf '%.0f' "$pos" 2>/dev/null || echo 0)
+
+    # Find current lyric line
+    local cur_idx=0
+    local i=1
+    while [[ $i -le $total ]]; do
+      if (( lrc_times[$i] <= pos_i )); then
+        cur_idx=$i
+      fi
+      i=$(( i + 1 ))
+    done
+
+    if (( cur_idx != last_idx )); then
+      last_idx=$cur_idx
+      clear 2>/dev/null || printf '\033[2J\033[H'
+      echo ""
+      echo "  ${C}♪ ${title}${X}  ${DIM}(synced — q to exit)${X}"
+      echo ""
+
+      # Show context: 3 before, current, 3 after
+      local ctx_start=$(( cur_idx - 3 ))
+      local ctx_end=$(( cur_idx + 4 ))
+      (( ctx_start < 1 )) && ctx_start=1
+      (( ctx_end > total )) && ctx_end=$total
+
+      local j=$ctx_start
+      while (( j <= ctx_end )); do
+        local lyric_line="${lrc_lines[$j]}"
+        if (( j == cur_idx )); then
+          printf "  ${G}${BOLD}▶ %-${tw}s${X}\n" "$lyric_line"
+        else
+          printf "  ${DIM}  %-${tw}s${X}\n" "$lyric_line"
+        fi
+        j=$(( j + 1 ))
+      done
+      echo ""
+      printf "  ${DIM}[%d:%02d]  q=quit  bar=back to progress bar${X}\n" \
+        "$(( pos_i / 60 ))" "$(( pos_i % 60 ))"
+    fi
+
+    local key
+    if read -r -s -k1 -t 0.3 key 2>/dev/null; then
+      [[ "$key" == "q" || "$key" == "Q" || "$key" == $'\e' ]] && break
+    fi
+  done
+
+  _lyrics_cleanup
+  trap - INT TERM EXIT
+}
+
+# ── v5-O — Terminal album art via chafa ──────────────────────────────────────
+do_art() {
+  _need
+  local url; url=$(_get path)
+  [ -z "$url" ] && { _warn "nothing playing"; return; }
+
+  if [[ -z "$CHAFA" || ! -x "$CHAFA" ]]; then
+    _warn "chafa not installed — install with: brew install chafa  or  apt install chafa"
+    return
+  fi
+  if [[ -z "$CURL" || ! -x "$CURL" ]]; then
+    _warn "curl required for album art"; return
+  fi
+
+  local title; title=$(_get media-title)
+  local vid; vid=$(echo "$url" | grep -oE '[?&]v=([A-Za-z0-9_-]{11})' | head -1 | cut -d= -f2)
+
+  if [[ -z "$vid" ]]; then
+    vid=$(echo "$url" | grep -oE '/shorts/([A-Za-z0-9_-]{11})' | head -1 | grep -oE '[A-Za-z0-9_-]{11}$')
+  fi
+
+  if [[ -z "$vid" ]]; then
+    _warn "album art only available for YouTube tracks"
+    return
+  fi
+
+  local thumb_url="https://img.youtube.com/vi/${vid}/maxresdefault.jpg"
+  local thumb_file; thumb_file=$(mktemp "/tmp/m_art_XXXXXX.jpg")
+
+  _info "fetching album art..."
+  if ! "$CURL" -sf --max-time 8 "$thumb_url" -o "$thumb_file" 2>/dev/null; then
+    # Fall back to lower resolution
+    thumb_url="https://img.youtube.com/vi/${vid}/hqdefault.jpg"
+    "$CURL" -sf --max-time 8 "$thumb_url" -o "$thumb_file" 2>/dev/null || {
+      rm -f "$thumb_file"; _err "could not fetch album art"; return 1
+    }
+  fi
+
+  echo ""
+  echo "  ${C}♪ ${title}${X}"
+  echo ""
+  "$CHAFA" --size "$(tput cols)x20" "$thumb_file" 2>/dev/null
+  echo ""
+  rm -f "$thumb_file"
+}
+
+# ── v5-Q — Unified TUI dashboard ─────────────────────────────────────────────
+do_ui() {
+  if ! command -v tmux >/dev/null 2>&1; then
+    _warn "tmux not installed — unified UI requires tmux"
+    _info "falling back to m bar..."
+    do_bar
+    return
+  fi
+
+  _need
+
+  local session="m_ui_$$"
+  local script_path="$0"
+
+  tmux new-session -d -s "$session" -x "$(tput cols)" -y "$(tput lines)" 2>/dev/null || {
+    _warn "could not create tmux session"; do_bar; return
+  }
+
+  # Layout: left=queue (30%), right-top=art (if chafa), right-bottom=bar
+  tmux split-window -h -l "30%" -t "$session"
+  tmux split-window -v -t "${session}:0.1"
+
+  # Pane 0 (left): queue — auto-refresh every 3s
+  tmux send-keys -t "${session}:0.0" \
+    "watch -n 3 '\"$script_path\" queue 2>/dev/null'" Enter
+
+  # Pane 1 (top-right): album art
+  if [[ -n "$CHAFA" && -x "$CHAFA" ]]; then
+    tmux send-keys -t "${session}:0.1" \
+      "while true; do \"$script_path\" art 2>/dev/null; sleep 10; done" Enter
+  else
+    tmux send-keys -t "${session}:0.1" \
+      "\"$script_path\" now" Enter
+  fi
+
+  # Pane 2 (bottom-right): live progress bar
+  tmux send-keys -t "${session}:0.2" "\"$script_path\" bar" Enter
+
+  tmux attach-session -t "$session"
+
+  # Cleanup on exit
+  tmux kill-session -t "$session" 2>/dev/null
+}
+
+# ── do_uxi — launch bridge server + open web dashboard in browser ─────────
+UXI_PORT="${UXI_PORT:-7700}"
+UXI_PID_FILE="$DATA_DIR/uxi_server.pid"
+
+do_uxi() {
+  local script_dir; script_dir="$(cd "$(dirname "$0")" && pwd)"
+
+  # Locate music_ui_server.py
+  local server_path=""
+  local candidates=(
+    "$script_dir/music_ui_server.py"
+    "$MUSIC_ROOT/music_ui_server.py"
+  )
+  for c in "${candidates[@]}"; do
+    [[ -f "$c" ]] && { server_path="$c"; break; }
+  done
+  [[ -z "$server_path" ]] && _die "music_ui_server.py not found — place it next to this script"
+
+  # Check if server is already running
+  if [[ -f "$UXI_PID_FILE" ]]; then
+    local old_pid; old_pid=$(cat "$UXI_PID_FILE" 2>/dev/null)
+    if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+      _info "uxi server already running (pid $old_pid) on port $UXI_PORT"
+      _open_browser "http://127.0.0.1:${UXI_PORT}"
+      return
+    fi
+    rm -f "$UXI_PID_FILE"
+  fi
+
+  # Check port availability — retry up to 7750
+  local port_ok=0
+  while [[ $UXI_PORT -le 7750 ]]; do
+    if ! (command -v lsof >/dev/null 2>&1 && lsof -i :"$UXI_PORT" >/dev/null 2>&1); then
+      port_ok=1
+      break
+    fi
+    [[ $UXI_PORT -lt 7750 ]] && _warn "port $UXI_PORT in use — trying $((UXI_PORT + 1))"
+    UXI_PORT=$((UXI_PORT + 1))
+  done
+  [[ $port_ok -eq 0 ]] && { _err "no free port in range 7700–7750"; return 1; }
+
+  # Require python3
+  local py3; py3=$(command -v python3 2>/dev/null)
+  [[ -z "$py3" ]] && _die "python3 required for uxi server — install python3"
+
+  # Start bridge server in background
+  _info "starting uxi bridge server on port $UXI_PORT…"
+  "$py3" "$server_path" "$UXI_PORT" > "$DATA_DIR/uxi_server.log" 2>&1 &
+  local srv_pid=$!
+  echo "$srv_pid" > "$UXI_PID_FILE"
+  disown "$srv_pid" 2>/dev/null
+
+  # Wait briefly for server to start
+  local tries=0
+  while (( tries < 15 )); do
+    if "$CURL" -sf --max-time 1 "http://127.0.0.1:${UXI_PORT}/api/state" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.2
+    tries=$((tries + 1))
+  done
+
+  if ! kill -0 "$srv_pid" 2>/dev/null; then
+    _err "uxi server failed to start — check $DATA_DIR/uxi_server.log"
+    rm -f "$UXI_PID_FILE"
+    return 1
+  fi
+
+  _ok "uxi server running → http://127.0.0.1:${UXI_PORT}  (pid $srv_pid)"
+  _open_browser "http://127.0.0.1:${UXI_PORT}"
+}
+
+_open_browser() {
+  local url="$1"
+  case "$OS" in
+    mac) open "$url" ;;
+    linux)
+      if command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "$url"
+      elif command -v sensible-browser >/dev/null 2>&1; then
+        sensible-browser "$url"
+      else
+        _info "open in browser: $url"
+      fi
+      ;;
+    *) _info "open in browser: $url" ;;
+  esac
+}
+
+do_uxi_stop() {
+  if [[ -f "$UXI_PID_FILE" ]]; then
+    local pid; pid=$(cat "$UXI_PID_FILE" 2>/dev/null)
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null
+      _ok "uxi server stopped (pid $pid)"
+    else
+      _info "uxi server not running"
+    fi
+    rm -f "$UXI_PID_FILE"
+  else
+    _info "uxi server not running"
+  fi
+}
+
+# ── v5-T — Bookmarks: named snapshots of queue + position ───────────────────
+do_bookmark() {
+  _need
+  local title; title=$(_get media-title)
+  [ -z "$title" ] && { _warn "nothing playing"; return; }
+
+  local pos; pos=$(_get time-pos | awk '{printf "%d:%02d",$1/60,$1%60}' 2>/dev/null)
+  local url; url=$(_get path)
+
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    name="$(date '+%Y%m%d_%H%M')_${title:0:30}"
+    name=$(printf '%s' "$name" | tr ' /' '_' | tr -cd '[:alnum:]_-')
+  fi
+
+  # Save queue snapshot with this name
+  local bm_dir="$DATA_DIR/bookmarks_dir"
+  mkdir -p "$bm_dir"
+  _queue_snapshot
+  cp "$QUEUE_SNAPSHOT" "$bm_dir/${name}.m3u" 2>/dev/null
+
+  # Log the bookmark entry
+  printf '%s\t%s\t%s\t%s\t%s\n' \
+    "$(date '+%Y-%m-%d %H:%M')" "$name" "$title" "$pos" "$(_clean_url "$url")" \
+    >> "$BOOKMARKS_FILE"
+
+  _ok "📌 bookmark saved: ${name}  (${title} @ ${pos})"
+}
+
+do_bookmarks() {
+  [ -s "$BOOKMARKS_FILE" ] || { _warn "no bookmarks yet — use: m bookmark"; return; }
+  echo ""
+  echo "  ${C}📌 bookmarks:${X}"
+  echo ""
+  awk -F'\t' '{printf "  ∙ %s  |  %s @ %s\n", $2, $3, $4}' "$BOOKMARKS_FILE"
+  echo ""
+}
+
+do_bookmark_load() {
+  [ -s "$BOOKMARKS_FILE" ] || { _warn "no bookmarks yet"; return; }
+  local line
+  line=$("$FZF" \
+    --height 50% --reverse \
+    --prompt "📌 bookmark > " \
+    --header "ENTER to restore · ESC cancel" \
+    --with-nth=2,3,4 --delimiter=$'\t' < "$BOOKMARKS_FILE")
+  [ -z "$line" ] && { _warn "cancelled"; return; }
+
+  local bm_name; bm_name=$(printf '%s' "$line" | awk -F'\t' '{print $2}')
+  local bm_pos; bm_pos=$(printf '%s' "$line" | awk -F'\t' '{print $4}')
+  local bm_dir="$DATA_DIR/bookmarks_dir"
+  local bm_file="$bm_dir/${bm_name}.m3u"
+
+  _start
+  _silent '{"command":["playlist-clear"]}'
+
+  if [[ -f "$bm_file" ]]; then
+    while IFS= read -r url; do
+      [ -z "$url" ] && continue
+      _ipc_loadfile "$url" "append-play"
+    done < "$bm_file"
+    _ok "📌 restored queue from bookmark: $bm_name"
+  else
+    # Fallback: just play the URL
+    local bm_url; bm_url=$(printf '%s' "$line" | awk -F'\t' '{print $5}')
+    _ipc_loadfile "$bm_url" "replace"
+    _ok "📌 restored track from bookmark: $bm_name"
+  fi
+
+  # Seek to saved position
+  if [[ -n "$bm_pos" && "$bm_pos" != "0:00" ]]; then
+    sleep 2  # wait for track to load
+    local m s target_secs
+    m=$(echo "$bm_pos" | cut -d: -f1 | sed 's/^0*//'); m=${m:-0}
+    s=$(echo "$bm_pos" | cut -d: -f2 | sed 's/^0*//'); s=${s:-0}
+    target_secs=$(( m * 60 + s ))
+    _silent "{\"command\":[\"seek\",\"$target_secs\",\"absolute\"]}"
+    _info "seeked to: $bm_pos"
+  fi
+}
+
+# ── v5-R — Auto-DJ toggle ────────────────────────────────────────────────────
+do_autodj() {
+  if [[ -f "$AUTODJ_FILE" ]]; then
+    rm -f "$AUTODJ_FILE"
+    AUTODJ_ENABLED=0
+    _ok "🤖 Auto-DJ: OFF"
+  else
+    touch "$AUTODJ_FILE"
+    AUTODJ_ENABLED=1
+    _ok "🤖 Auto-DJ: ON  (queue will auto-refill from Last.fm/YouTube when empty)"
+    [[ -z "$LASTFM_API_KEY" ]] && _warn "tip: set LASTFM_API_KEY in config for better recommendations"
+  fi
+}
+
+# ── txt playlist system ───────────────────────────────────────
+_txt_state_write() {
+  local file="$1" idx="$2"
+  printf '%s\t%s\n' "$file" "$idx" > "$TXT_STATE_FILE"
+}
+
+_txt_state_read() {
+  TXT_ACTIVE_FILE=""
+  TXT_ACTIVE_IDX=0
+  [ -f "$TXT_STATE_FILE" ] || return
+  TXT_ACTIVE_FILE=$(awk -F'\t' '{print $1}' "$TXT_STATE_FILE")
+  TXT_ACTIVE_IDX=$(awk -F'\t' '{print $2}' "$TXT_STATE_FILE")
+  [ -f "$TXT_ACTIVE_FILE" ] || { TXT_ACTIVE_FILE=""; TXT_ACTIVE_IDX=0; }
+}
+
+_txt_read_lines() {
+  local f="$1"
+  TXT_LINES=()
+  while IFS= read -r line; do
+    line="${line#"${line%%[! ]*}"}"
+    line="${line%"${line##*[! ]}"}"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    TXT_LINES+=("$line")
+  done < "$f"
+}
+
+_txt_resolve() {
+  local arg="$1"
+  [ -f "$arg" ] && { echo "$arg"; return; }
+  [ -f "$TXTS_DIR/${arg}.txt" ] && { echo "$TXTS_DIR/${arg}.txt"; return; }
+  [ -f "$TXTS_DIR/${arg}" ] && { echo "$TXTS_DIR/${arg}"; return; }
+  echo ""
+}
+
+_txt_search_and_play_line() {
+  local query="$1"
+  local key="$CACHE_DIR/$(_cache_key "$query").cache"
+  local results url
+
+  local _txt_n="${SEARCH_RESULTS:-5}"
+  (( _txt_n > 5 )) && _txt_n=5
+
+  if [ -f "$key" ] && [ "$(_cache_age "$key")" -lt "$CACHE_TTL" ]; then
+    results=$(cat "$key")
+  else
+    # v5-Z: use _do_search which has proper PIPESTATUS-equivalent error handling
+    results=$(_do_search "$query" "$_txt_n") || return 1
+    local valid_count; valid_count=$(echo "$results" | grep -cE 'https?://' 2>/dev/null || echo 0)
+    [[ -n "$results" ]] && (( valid_count >= 1 )) && echo "$results" > "$key"
+  fi
+
+  [ -z "$results" ] && return 1
+  url=$(echo "$results" | head -1 | awk -F ' \| ' '{print $NF}')
+  echo "$url"
+}
+
+# v5-C — _txt_kill_bg_job: PID written atomically BEFORE disown
+_txt_kill_bg_job() {
+  local bg_pid_file="$DATA_DIR/txt_bg_pid"
+  if [ -f "$bg_pid_file" ]; then
+    local old_pid; old_pid=$(cat "$bg_pid_file" 2>/dev/null)
+    if [ -n "$old_pid" ]; then
+      kill -TERM -- "-$old_pid" 2>/dev/null || kill -TERM "$old_pid" 2>/dev/null
+      sleep 0.2
+      kill -0 "$old_pid" 2>/dev/null && kill -KILL "$old_pid" 2>/dev/null
+    fi
+    rm -f "$bg_pid_file"
+  fi
+  local cur_gen=0
+  [ -f "$TXT_BG_GEN_FILE" ] && cur_gen=$(cat "$TXT_BG_GEN_FILE" 2>/dev/null || echo 0)
+  echo $(( cur_gen + 1 )) > "$TXT_BG_GEN_FILE"
+}
+
+# v5-N — Parallel txt resolution: all lines resolved concurrently
+do_txt() {
+  local arg="${1:-}"
+  local resume_flag="${2:-}"
+  local chosen_file=""
+
+  if [ -z "$arg" ]; then
+    local files=("$TXTS_DIR"/*.txt(N))
+    if [ ${#files[@]} -eq 0 ]; then
+      _warn "no .txt files in $TXTS_DIR"
+      _info "create one and drop it there — one song name per line"
+      return
+    fi
+    local display=()
+    for f in "${files[@]}"; do
+      local n; n=$(grep -cvE '^\s*(#|$)' "$f" 2>/dev/null || echo 0)
+      display+=("$(basename "$f" .txt)  (${n} songs)")
+    done
+    local picked
+    picked=$(printf '%s\n' "${display[@]}" | "$FZF" \
+      --height 50% --reverse \
+      --prompt "📄 txt playlist > " \
+      --header "ENTER to load · ESC cancel")
+    [ -z "$picked" ] && { _warn "cancelled"; return; }
+    local fname; fname=$(echo "$picked" | awk '{print $1}')
+    chosen_file="$TXTS_DIR/${fname}.txt"
+  else
+    chosen_file=$(_txt_resolve "$arg")
+    [ -z "$chosen_file" ] && { _err "txt file not found: $arg  (looked in $TXTS_DIR)"; return 1; }
+  fi
+
+  _txt_read_lines "$chosen_file"
+  [ ${#TXT_LINES[@]} -eq 0 ] && { _err "txt file is empty or has only comments: $chosen_file"; return 1; }
+
+  _start
+
+  # v5-U: --resume flag restores last position
+  local start_idx=0
+  if [[ "$resume_flag" == "--resume" || "$resume_flag" == "-r" ]]; then
+    _txt_state_read
+    if [[ "$TXT_ACTIVE_FILE" == "$chosen_file" && $TXT_ACTIVE_IDX -gt 0 ]]; then
+      start_idx=$TXT_ACTIVE_IDX
+      _info "resuming txt playlist at position $((start_idx + 1))"
+    fi
+  fi
+
+  local fname_display; fname_display=$(basename "$chosen_file" .txt)
+  _info "loading txt playlist: ${fname_display}  (${#TXT_LINES[@]} songs)"
+
+  _txt_kill_bg_job
+  _txt_state_write "$chosen_file" "$start_idx"
+  _silent '{"command":["playlist-clear"]}'
+
+  # Play first (or resumed) track
+  local first_query="${TXT_LINES[$(( start_idx + 1 ))]}"
+  local first_url
+  first_url=$(_txt_search_and_play_line "$first_query")
+  if [ -z "$first_url" ]; then
+    _warn "could not find: ${first_query} — skipping"
+  else
+    _ipc_loadfile "$first_url" "replace"
+  fi
+
+  # Capture variables for bg job
+  local _bg_socat="$SOCAT" _bg_socket="$SOCKET" _bg_jq="$JQ"
+  local _bg_ytdlp="$YTDLP" _bg_cache_dir="$CACHE_DIR" _bg_cache_ttl="$CACHE_TTL"
+  local _bg_search_n="${SEARCH_RESULTS:-5}"
+  (( _bg_search_n > 5 )) && _bg_search_n=5
+  local _bg_gen; _bg_gen=$(cat "$TXT_BG_GEN_FILE" 2>/dev/null || echo 0)
+  local _bg_gen_file="$TXT_BG_GEN_FILE"
+  local _bg_youtube_api_key="$YOUTUBE_API_KEY"
+  local _bg_invidious_host="$INVIDIOUS_HOST"
+  local _bg_curl="$CURL"
+
+  # v5-N — parallel resolution: workers write to numbered files; parent reads in order.
+  # Semaphore counter file for throttle (pids array in subshell doesn't work).
+  local txt_tmpdir; txt_tmpdir=$(mktemp -d "$DATA_DIR/txt_resolve.XXXXXX")
+  local sem_file="$txt_tmpdir/sem"
+  echo 0 > "$sem_file"
+
+  (
+    local socat="$_bg_socat" socket="$_bg_socket" jq="$_bg_jq"
+    local ytdlp="$_bg_ytdlp" cache_dir="$_bg_cache_dir" cache_ttl="$_bg_cache_ttl"
+    local my_gen="$_bg_gen" gen_file="$_bg_gen_file"
+    local search_n="$_bg_search_n"
+    local yt_api_key="$_bg_youtube_api_key"
+    local inv_host="$_bg_invidious_host"
+    local curl_bin="$_bg_curl"
+    local tmpdir="$txt_tmpdir" sem="$sem_file"
+    local _user_for_cache="${USER:-$(id -un)}"
+
+    _bg_search_one() {
+      local query="$1"
+      local key
+      if [[ "$(uname -s)" = "Darwin" ]]; then
+        key="${cache_dir}/$(printf '%s\0%s' "$_user_for_cache" "$query" | md5 -q 2>/dev/null).cache"
+      else
+        key="${cache_dir}/$(printf '%s\0%s' "$_user_for_cache" "$query" | md5sum 2>/dev/null | cut -c1-32).cache"
+      fi
+      [[ "$key" = "${cache_dir}/.cache" ]] && key="${cache_dir}/$(printf '%s' "$query" | md5sum 2>/dev/null | cut -c1-32).cache"
+
+      # Check cache first
+      if [ -f "$key" ] && [ $(( $(date +%s) - $(stat -c%Y "$key" 2>/dev/null || stat -f%m "$key" 2>/dev/null || echo 0) )) -lt "$cache_ttl" ]; then
+        cat "$key"; return 0
+      fi
+
+      local results=""
+
+      # Try YouTube Data API v3
+      if [[ -n "$yt_api_key" && -n "$curl_bin" && -x "$curl_bin" ]]; then
+        local enc_q; enc_q=$(printf '%s' "$query" | "$jq" -Rr '@uri' 2>/dev/null)
+        local api_resp
+        api_resp=$("$curl_bin" -sf --max-time 8 \
+          "https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoCategoryId=10&maxResults=1&q=${enc_q}&key=${yt_api_key}" \
+          2>/dev/null) || true
+        if [[ -n "$api_resp" ]]; then
+          local vid_id title_r
+          vid_id=$(echo "$api_resp" | "$jq" -r '.items[0].id.videoId // empty' 2>/dev/null)
+          title_r=$(echo "$api_resp" | "$jq" -r '.items[0].snippet.title // empty' 2>/dev/null)
+          if [[ -n "$vid_id" ]]; then
+            results="${title_r} |  | https://www.youtube.com/watch?v=${vid_id}"
+          fi
+        fi
+      fi
+
+      # Try Invidious
+      if [[ -z "$results" && -n "$inv_host" && -n "$curl_bin" && -x "$curl_bin" ]]; then
+        local enc_q; enc_q=$(printf '%s' "$query" | "$jq" -Rr '@uri' 2>/dev/null)
+        local inv_resp
+        inv_resp=$("$curl_bin" -sf --max-time 8 \
+          "${inv_host}/api/v1/search?q=${enc_q}&type=video&fields=title,videoId&page=1" \
+          2>/dev/null) || true
+        if [[ -n "$inv_resp" ]]; then
+          local vid_id title_r
+          vid_id=$(echo "$inv_resp" | "$jq" -r '.[0].videoId // empty' 2>/dev/null)
+          title_r=$(echo "$inv_resp" | "$jq" -r '.[0].title // empty' 2>/dev/null)
+          if [[ -n "$vid_id" ]]; then
+            results="${title_r} |  | https://www.youtube.com/watch?v=${vid_id}"
+          fi
+        fi
+      fi
+
+      # Fall back to yt-dlp
+      if [[ -z "$results" ]]; then
+        results=$("$ytdlp" "ytsearch${search_n}:${query}" \
+          --print "%(title)s | %(duration_string)s | %(webpage_url)s" \
+          --no-download --no-warnings 2>/dev/null | head -1)
+      fi
+
+      if [[ -n "$results" ]]; then
+        echo "$results" > "$key"
+        echo "$results"
+      fi
+    }
+
+    # Spawn workers: each writes to tmpdir/$i; semaphore limits concurrency
+    local i=$(( start_idx + 2 ))
+    while [ $i -le ${#TXT_LINES[@]} ]; do
+      local cur_gen; cur_gen=$(cat "$gen_file" 2>/dev/null || echo 0)
+      [ "$cur_gen" = "$my_gen" ] || { rm -rf "$tmpdir"; exit 0; }
+
+      # Semaphore: wait until running < 4
+      while true; do
+        local running; running=$(cat "$sem" 2>/dev/null || echo 0)
+        [[ "$running" -lt 4 ]] && break
+        sleep 0.05
+      done
+      echo $(( $(cat "$sem" 2>/dev/null || echo 0) + 1 )) > "$sem"
+
+      local query="${TXT_LINES[$i]}"
+      (
+        local cur; cur=$(cat "$gen_file" 2>/dev/null || echo 0)
+        [ "$cur" = "$my_gen" ] || { echo $(( $(cat "$sem" 2>/dev/null) - 1 )) > "$sem"; exit 0; }
+        local result; result=$(_bg_search_one "$query")
+        local cnt; cnt=$(cat "$sem" 2>/dev/null || echo 0)
+        echo $(( cnt - 1 )) > "$sem"
+        [ -z "$result" ] && exit 0
+        local url; url=$(echo "$result" | head -1 | awk -F ' \| ' '{print $NF}')
+        [ -z "$url" ] && exit 0
+        echo "$url" > "$tmpdir/$i"
+      ) &
+
+      i=$(( i + 1 ))
+    done
+
+    wait
+
+    # Read results in order and append to mpv
+    local j=$(( start_idx + 2 ))
+    while [ $j -le ${#TXT_LINES[@]} ]; do
+      [ "$(cat "$gen_file" 2>/dev/null || echo 0)" = "$my_gen" ] || break
+      if [ -f "$tmpdir/$j" ]; then
+        local url; url=$(cat "$tmpdir/$j" 2>/dev/null)
+        [ -n "$url" ] && {
+          local json; json=$("$jq" -cn --arg url "$url" '{"command":["loadfile",$url,"append"]}')
+          echo "$json" | "$socat" - "$socket" >/dev/null 2>&1
+        }
+      fi
+      j=$(( j + 1 ))
+    done
+    rm -rf "$tmpdir"
+  ) &
+
+  local bg_pid=$!
+  # v5-C: write PID file atomically BEFORE disown (tempfile swap)
+  local tmpf_pid; tmpf_pid=$(mktemp "$DATA_DIR/txt_bg_pid.XXXXXX")
+  echo $bg_pid > "$tmpf_pid" && mv "$tmpf_pid" "$DATA_DIR/txt_bg_pid" || rm -f "$tmpf_pid"
+  disown $bg_pid
+
+  local title; title=$(_wait_title "$first_url" 30)
+  _ok "▶  ${title:-${TXT_LINES[1]}}"
+  _info "use: m txtnext (tn) / m txtprev (tp) to step through"
+}
+
+do_txtnext() {
+  _need
+  _txt_state_read
+  [ -z "$TXT_ACTIVE_FILE" ] && { _err "no active txt playlist — start one with: m txt"; return 1; }
+  _txt_read_lines "$TXT_ACTIVE_FILE"
+  local total=${#TXT_LINES[@]}
+  local next_idx=$(( TXT_ACTIVE_IDX + 1 ))
+  if [ $next_idx -ge $total ]; then
+    _warn "end of txt playlist: $(basename "$TXT_ACTIVE_FILE" .txt)  ($total songs)"
+    return
+  fi
+  _txt_kill_bg_job
+  _txt_state_write "$TXT_ACTIVE_FILE" "$next_idx"
+  local query="${TXT_LINES[$(( next_idx + 1 ))]}"
+  _info "searching: ${query}"
+  local url; url=$(_txt_search_and_play_line "$query")
+  [ -z "$url" ] && { _warn "could not find: $query"; return; }
+  _silent '{"command":["playlist-clear"]}'
+  _ipc_loadfile "$url" "replace"
+  local title; title=$(_wait_title "$url" 20)
+  _ok "⏭  [$(( next_idx + 1 ))/${total}]  ${title:-$query}"
+}
+
+do_txtprev() {
+  _need
+  _txt_state_read
+  [ -z "$TXT_ACTIVE_FILE" ] && { _err "no active txt playlist — start one with: m txt"; return 1; }
+  _txt_read_lines "$TXT_ACTIVE_FILE"
+  local total=${#TXT_LINES[@]}
+  local prev_idx=$(( TXT_ACTIVE_IDX - 1 ))
+  if [ $prev_idx -lt 0 ]; then
+    _warn "already at start of txt playlist: $(basename "$TXT_ACTIVE_FILE" .txt)"
+    return
+  fi
+  _txt_kill_bg_job
+  _txt_state_write "$TXT_ACTIVE_FILE" "$prev_idx"
+  local query="${TXT_LINES[$(( prev_idx + 1 ))]}"
+  _info "searching: ${query}"
+  local url; url=$(_txt_search_and_play_line "$query")
+  [ -z "$url" ] && { _warn "could not find: $query"; return; }
+  _silent '{"command":["playlist-clear"]}'
+  _ipc_loadfile "$url" "replace"
+  local title; title=$(_wait_title "$url" 20)
+  _ok "⏮  [$(( prev_idx + 1 ))/${total}]  ${title:-$query}"
+}
+
+do_txtnow() {
+  _txt_state_read
+  if [ -z "$TXT_ACTIVE_FILE" ]; then
+    _warn "no active txt playlist"; _info "start one with: m txt"; return
+  fi
+  _txt_read_lines "$TXT_ACTIVE_FILE"
+  local total=${#TXT_LINES[@]}
+  local current_query="${TXT_LINES[$(( TXT_ACTIVE_IDX + 1 ))]}"
+  echo ""
+  echo "  ${C}txt playlist:${X}  $(basename "$TXT_ACTIVE_FILE" .txt)"
+  echo "  ${W}position:${X}    $(( TXT_ACTIVE_IDX + 1 )) / ${total}"
+  echo "  ${W}current:${X}     ${current_query}"
+  echo ""
+  local ctx_start=$(( TXT_ACTIVE_IDX - 2 ))
+  local ctx_end=$(( TXT_ACTIVE_IDX + 3 ))
+  (( ctx_start < 0 )) && ctx_start=0
+  (( ctx_end > total - 1 )) && ctx_end=$(( total - 1 ))
+  local i=$ctx_start
+  while [ $i -le $ctx_end ]; do
+    local line="${TXT_LINES[$(( i + 1 ))]}"
+    if [ $i -eq $TXT_ACTIVE_IDX ]; then
+      printf "  ${G}▶ %d. %s${X}\n" "$(( i + 1 ))" "$line"
+    else
+      printf "    %d. %s\n" "$(( i + 1 ))" "$line"
+    fi
+    i=$(( i + 1 ))
+  done
+  echo ""
+}
+
+do_txts() {
+  echo ""
+  printf "  ${C}txt playlists  →  %s${X}\n" "$TXTS_DIR"
+  echo ""
+  local found=0
+  _txt_state_read
+  for f in "$TXTS_DIR"/*.txt(N); do
+    local name; name=$(basename "$f" .txt)
+    local count; count=$(grep -cvE '^\s*(#|$)' "$f" 2>/dev/null || echo 0)
+    if [ "$f" = "$TXT_ACTIVE_FILE" ]; then
+      printf "  ${G}▶${X} ${W}%s${X}  (%s songs)  ${C}→ m txt %s${X}\n" "$name" "$count" "$name"
+    else
+      printf "  ∙ ${W}%s${X}  (%s songs)  ${C}→ m txt %s${X}\n" "$name" "$count" "$name"
+    fi
+    found=1
+  done
+  if [ $found -eq 0 ]; then
+    echo "  (none yet)"
+    echo ""
+    printf "  ${Y}How to add:${X} drop a .txt file into %s\n" "$TXTS_DIR"
+    echo "  One song name per line. Lines starting with # are comments."
+  fi
+  echo ""
+}
+
+do_txtpick() {
+  _need
+  _txt_state_read
+  [ -z "$TXT_ACTIVE_FILE" ] && { _err "no active txt playlist — start one with: m txt"; return 1; }
+  _txt_read_lines "$TXT_ACTIVE_FILE"
+  local total=${#TXT_LINES[@]}
+  local display=()
+  local i=0
+  while [ $i -lt $total ]; do
+    local marker="  "; [ $i -eq $TXT_ACTIVE_IDX ] && marker="▶ "
+    display+=("${marker}$(( i + 1 )). ${TXT_LINES[$(( i + 1 ))]}")
+    i=$(( i + 1 ))
+  done
+  local chosen
+  chosen=$(printf '%s\n' "${display[@]}" | "$FZF" \
+    --height 60% --reverse \
+    --prompt "📄 jump to > " \
+    --header "▶ = current · ENTER to play · ESC cancel" \
+    --no-sort)
+  [ -z "$chosen" ] && { _warn "cancelled"; return; }
+  local num; num=$(echo "$chosen" | grep -oE '[0-9]+\.' | head -1 | tr -d '.')
+  [ -z "$num" ] && { _err "could not parse selection"; return 1; }
+  local new_idx=$(( num - 1 ))
+  local query="${TXT_LINES[$num]}"
+  _info "searching: ${query}"
+  local url; url=$(_txt_search_and_play_line "$query")
+  [ -z "$url" ] && { _warn "could not find: $query"; return; }
+  _txt_state_write "$TXT_ACTIVE_FILE" "$new_idx"
+  _txt_kill_bg_job
+  _silent '{"command":["playlist-clear"]}'
+  _ipc_loadfile "$url" "replace"
+  local title; title=$(_wait_title "$url" 20)
+  local total_n; total_n=${#TXT_LINES[@]}
+  _ok "▶  [${num}/${total_n}]  ${title:-$query}"
+}
+
+do_txtedit() {
+  local arg="${1:-}"
+  local f
+  if [ -z "$arg" ]; then
+    local files=("$TXTS_DIR"/*.txt(N))
+    [ ${#files[@]} -eq 0 ] && { _err "no txt files in $TXTS_DIR"; return 1; }
+    local picked
+    picked=$(printf '%s\n' "${files[@]}" | xargs -I{} basename {} .txt | "$FZF" \
+      --height 40% --reverse --prompt "✏  edit > " --header "pick file to edit")
+    [ -z "$picked" ] && { _warn "cancelled"; return; }
+    f="$TXTS_DIR/${picked}.txt"
+  else
+    f=$(_txt_resolve "$arg")
+    if [ -z "$f" ]; then
+      f="$TXTS_DIR/${arg}.txt"
+      _info "creating new txt playlist: $arg"
+      printf '# %s\n# one song name per line, blank lines and # lines are ignored\n\n' "$arg" > "$f"
+    fi
+  fi
+  local editor="${EDITOR:-nano}"
+  "$editor" "$f"
+  local count; count=$(grep -cvE '^\s*(#|$)' "$f" 2>/dev/null || echo 0)
+  _ok "saved: $(basename "$f")  (${count} songs)"
+}
+
+do_txt_export() {
+  _txt_state_read
+  [ -z "$TXT_ACTIVE_FILE" ] && { _err "no active txt playlist — start one with: m txt"; return 1; }
+  local name; name=$(basename "$TXT_ACTIVE_FILE" .txt)
+  local out="$PLAYLIST_DIR/${name}.m3u"
+  _txt_read_lines "$TXT_ACTIVE_FILE"
+  [ ${#TXT_LINES[@]} -eq 0 ] && { _err "txt file is empty"; return 1; }
+  _info "resolving ${#TXT_LINES[@]} songs to URLs (this may take a while)..."
+  local tmpf; tmpf=$(mktemp "$PLAYLIST_DIR/${name}.XXXXXX")
+  local count=0 i=1
+  while [ $i -le ${#TXT_LINES[@]} ]; do
+    local url; url=$(_txt_search_and_play_line "${TXT_LINES[$i]}")
+    if [ -n "$url" ]; then
+      echo "$url" >> "$tmpf"
+      count=$(( count + 1 ))
+      printf '\r\e[2K  → resolved %d/%d...' "$count" "${#TXT_LINES[@]}" >&2
+    else
+      _warn "skipped (not found): ${TXT_LINES[$i]}"
+    fi
+    i=$(( i + 1 ))
+  done
+  printf '\r\e[2K' >&2
+  if [[ $count -eq 0 ]]; then rm -f "$tmpf"; _err "could not resolve any tracks"; return 1; fi
+  mv "$tmpf" "$out"
+  _ok "exported '${name}' txt → m3u  (${count} tracks)  →  m load ${name}"
+}
+
+# ── sleep timer ───────────────────────────────────────────────
+_sleep_timer_cancel() {
+  local timer_file="$DATA_DIR/sleep_timer_pid"
+  if [[ -f "$timer_file" ]]; then
+    local tpid; tpid=$(cat "$timer_file" 2>/dev/null)
+    [[ -n "$tpid" ]] && kill "$tpid" 2>/dev/null
+    rm -f "$timer_file"
+  fi
+}
+
+do_sleep() {
+  _need
+  if [[ "${1:-}" == "cancel" || "${1:-}" == "off" ]]; then
+    _sleep_timer_cancel; _ok "sleep timer cancelled"; return
+  fi
+  [[ -z "${1:-}" ]] && { _err "usage: m sleep <minutes> | cancel"; return 1; }
+  [[ "${1:-}" =~ ^[0-9]+$ ]] || { _err "usage: m sleep <minutes>  (integer)"; return 1; }
+  local mins="$1" secs=$(( $1 * 60 ))
+  _sleep_timer_cancel
+  local timer_file="$DATA_DIR/sleep_timer_pid"
+  (
+    sleep "$secs"
+    echo '{"command":["set_property","pause",true]}' | "$SOCAT" - "$SOCKET" >/dev/null 2>&1
+    sleep 2
+    if [[ -f "$MPV_PID_FILE" ]]; then
+      local pid; pid=$(cat "$MPV_PID_FILE" 2>/dev/null)
+      [[ -n "$pid" ]] && kill "$pid" 2>/dev/null
+    fi
+    rm -f "$timer_file"
+  ) &
+  local tpid=$!
+  echo $tpid > "$timer_file"
+  disown $tpid
+  _ok "⏲  sleep timer set: ${mins} minute(s)  (m sleep cancel to abort)"
+}
+
+# ── equalizer & normalisation ─────────────────────────────────
+_EQ_BASS="lavfi=[equalizer=f=80:t=h:w=200:g=6,equalizer=f=40:t=h:w=80:g=4]"
+_EQ_TREBLE="lavfi=[equalizer=f=8000:t=h:w=4000:g=5,equalizer=f=16000:t=h:w=4000:g=3]"
+_EQ_VOCAL="lavfi=[equalizer=f=300:t=h:w=200:g=-2,equalizer=f=3000:t=h:w=2000:g=4]"
+_EQ_LOUD="lavfi=[equalizer=f=60:t=h:w=120:g=5,equalizer=f=12000:t=h:w=6000:g=4,equalizer=f=1000:t=h:w=1000:g=-1]"
+
+_af_set() {
+  local filter="$1"
+  local json; json=$("$JQ" -cn --arg af "$filter" '{"command":["set_property","af",$af]}')
+  _silent_retry "$json"
+}
+
+_af_get_raw() {
+  local raw; raw=$(_cmd '{"command":["get_property","af"]}' 2>/dev/null)
+  echo "$raw" | "$JQ" -r '.data // ""' 2>/dev/null
+}
+
+do_eq() {
+  _need
+  local preset="${1:-}"
+  case "$preset" in
+    flat|off|none)
+      local current; current=$(_af_get_raw)
+      local new_af
+      if echo "$current" | grep -qF "loudnorm"; then
+        new_af=$(echo "$current" | awk -v frag="equalizer" 'BEGIN{FS=OFS=","}{ result=""; for(i=1;i<=NF;i++){if(index($i,frag)==0) result=(result==""?$i:result","$i)} print result }')
+        new_af=$(echo "$new_af" | sed 's/lavfi=\[,/lavfi=[/g; s/,\]/]/g; s/lavfi=\[\]//g')
+        _af_set "${new_af:-}"
+      else
+        _af_set ""
+      fi
+      _ok "🎚  equalizer: flat (off)"
+      ;;
+    bass)   _af_set "$_EQ_BASS";   _ok "🎚  equalizer: bass boost" ;;
+    treble) _af_set "$_EQ_TREBLE"; _ok "🎚  equalizer: treble boost" ;;
+    vocal)  _af_set "$_EQ_VOCAL";  _ok "🎚  equalizer: vocal" ;;
+    loud|loudness) _af_set "$_EQ_LOUD"; _ok "🎚  equalizer: loudness" ;;
+    '')
+      local cur; cur=$(_af_get_raw)
+      _info "current af filter: ${cur:-flat/off}"
+      echo ""
+      echo "  presets: flat  bass  treble  vocal  loud"
+      echo "  usage:   m eq <preset>"
+      echo ""
+      ;;
+    *)
+      _err "unknown preset: $preset  (flat | bass | treble | vocal | loud)"
+      return 1
+      ;;
+  esac
+}
+
+do_norm() {
+  _need
+  local current; current=$(_af_get_raw)
+  if echo "$current" | grep -qF "loudnorm"; then
+    local new_af; new_af=$(echo "$current" | awk 'BEGIN{FS=OFS=","}{result=""; for(i=1;i<=NF;i++){if(index($i,"acompressor")==0 && index($i,"loudnorm")==0) result=(result==""?$i:result","$i)} print result }')
+    _af_set "${new_af:-}"
+    _ok "🔇 loudness normalisation: OFF"
+  else
+    local new_af="${current:+${current},}acompressor,loudnorm"
+    _af_set "$new_af"
+    _ok "🔊 loudness normalisation: ON  (levels balanced across tracks)"
+  fi
+}
+
+# ── v5-G — do_similar: python3 replaced with jq @uri ─────────────────────────
+do_similar() {
+  _need
+  [ -s "$HISTORY_FILE" ] || { _warn "no history yet — play some tracks first"; return; }
+  local seeds; seeds=$(_tac "$HISTORY_FILE" | awk -F'\t' '!seen[$2]++ {print $2}' | head -3)
+  [ -z "$seeds" ] && { _warn "not enough history"; return; }
+  local seed_title; seed_title=$(echo "$seeds" | head -1)
+
+  if [[ -n "${LASTFM_API_KEY:-}" ]] && command -v curl >/dev/null 2>&1; then
+    _info "querying Last.fm for tracks similar to: ${seed_title}"
+    local artist track
+    if echo "$seed_title" | grep -q ' - '; then
+      artist=$(echo "$seed_title" | cut -d'-' -f1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+      track=$(echo "$seed_title"  | cut -d'-' -f2- | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    else
+      artist=""; track="$seed_title"
+    fi
+
+    # v5-G: use jq @uri instead of python3
+    local enc_artist; enc_artist=$(printf '%s' "$artist" | "$JQ" -Rr '@uri' 2>/dev/null)
+    local enc_track; enc_track=$(printf '%s' "$track" | "$JQ" -Rr '@uri' 2>/dev/null)
+
+    local lastfm_resp
+    lastfm_resp=$(curl -s --max-time 8 \
+      "https://ws.audioscrobbler.com/2.0/?method=track.getsimilar&artist=${enc_artist}&track=${enc_track}&api_key=${LASTFM_API_KEY}&format=json&limit=10" \
+      2>/dev/null)
+
+    local similar_title
+    similar_title=$(echo "$lastfm_resp" | "$JQ" -r \
+      '.similartracks.track[] | "\(.artist.name) - \(.name)"' 2>/dev/null \
+      | grep -v "^null" | head -5 \
+      | awk 'BEGIN{srand()} {a[NR]=$0} END{if(NR>0) print a[int(rand()*NR)+1]}')
+
+    if [[ -n "$similar_title" ]]; then
+      _info "Last.fm recommends: ${similar_title}"
+      local url; url=$(_pick "$similar_title") || return 1
+      [ -z "$url" ] && { _warn "cancelled"; return; }
+      _ipc_loadfile "$url" "append-play"
+      _ok "➕ added Last.fm similar track: ${similar_title}"
+      _queue_snapshot
+      return
+    fi
+    _warn "Last.fm returned no similar tracks — falling back to YouTube search"
+  fi
+
+  _info "YouTube keyword search for: ${seed_title}  (set LASTFM_API_KEY for real recommendations)"
+  local url; url=$(_pick "$seed_title") || return 1
+  [ -z "$url" ] && { _warn "cancelled"; return; }
+  _ipc_loadfile "$url" "append-play"
+  _ok "➕ added to queue (YouTube keyword match — not semantic similarity)"
+  _queue_snapshot
+}
+
+# ── v5-H — do_export: CSV injection guard ─────────────────────────────────────
+do_export() {
+  local target="${1:-likes}"
+  local file
+  case "$target" in
+    likes)   file="$LIKES_FILE" ;;
+    history) file="$HISTORY_FILE" ;;
+    *) _err "usage: m export [likes|history]"; return 1 ;;
+  esac
+  [ -s "$file" ] || { _warn "no data to export in: $target"; return; }
+  echo "date,title,url"
+  awk -F'\t' '{
+    # Escape double-quotes
+    gsub(/"/, "\"\"", $1); gsub(/"/, "\"\"", $2); gsub(/"/, "\"\"", $3)
+    # v5-H: CSV injection guard — prefix dangerous leading chars with apostrophe (OWASP)
+    if ($2 ~ /^[=+\-@]/) $2 = "\047" $2
+    if ($3 ~ /^[=+\-@]/) $3 = "\047" $3
+    printf "\"%s\",\"%s\",\"%s\"\n", $1, $2, $3
+  }' "$file"
+}
+
+# ── v5-X — m index: scan local music library ─────────────────────────────────
+do_index() {
+  if [[ -z "$FFPROBE" || ! -x "$FFPROBE" ]]; then
+    _warn "ffprobe not found — install ffmpeg for local library indexing"
+    _info "macOS: brew install ffmpeg | Linux: apt install ffmpeg"
+    return 1
+  fi
+  [[ -d "$LOCAL_MUSIC_DIR" ]] || { _err "LOCAL_MUSIC_DIR not found: $LOCAL_MUSIC_DIR"; return 1; }
+
+  _info "indexing $LOCAL_MUSIC_DIR ..."
+  local tmpf; tmpf=$(mktemp "$DATA_DIR/index.XXXXXX")
+  local count=0
+
+  # Find all audio files
+  find "$LOCAL_MUSIC_DIR" -type f \( \
+    -iname "*.mp3" -o -iname "*.flac" -o -iname "*.m4a" -o \
+    -iname "*.ogg" -o -iname "*.opus" -o -iname "*.wav" -o \
+    -iname "*.aac" -o -iname "*.wma" \
+  \) | while IFS= read -r f; do
+    local title artist album duration
+    title=$("$FFPROBE" -v quiet -print_format json -show_entries \
+      format_tags=title,artist,album format=duration \
+      "$f" 2>/dev/null | "$JQ" -r '
+        (.format.tags.title // (.format.tags.TITLE // "")) as $t |
+        (.format.tags.artist // (.format.tags.ARTIST // "")) as $a |
+        (.format.tags.album // (.format.tags.ALBUM // "")) as $al |
+        (.format.duration // "0") as $d |
+        "\($t)\t\($a)\t\($al)\t\($d)"
+      ' 2>/dev/null) || true
+
+    # Fallback to filename
+    if [[ -z "$title" || "$title" == $'\t\t\t'* ]]; then
+      title="$(basename "$f" | sed 's/\.[^.]*$//')"$'\t''Unknown'$'\t''Unknown'$'\t0'
+    fi
+
+    printf '%s\t%s\n' "$f" "$title" >> "$tmpf"
+    count=$(( count + 1 ))
+    (( count % 50 == 0 )) && printf '\r\e[2K  → indexed %d files...' "$count" >&2
+  done
+
+  printf '\r\e[2K' >&2
+  mv "$tmpf" "$LOCAL_INDEX"
+  count=$(wc -l < "$LOCAL_INDEX" | tr -d ' ')
+  _ok "indexed ${count} tracks → $LOCAL_INDEX"
+  _info "use: m local \"song name\" to search your library"
+}
+
+do_local() {
+  [[ -f "$LOCAL_INDEX" ]] || { _err "no local index — run: m index first"; return 1; }
+  local query="${1:-}"
+
+  local results
+  if [[ -n "$query" ]]; then
+    results=$(grep -i "$query" "$LOCAL_INDEX" 2>/dev/null | head -50)
+  else
+    results=$(cat "$LOCAL_INDEX")
+  fi
+
+  [[ -z "$results" ]] && { _warn "no local tracks matching: $query"; return; }
+
+  local chosen
+  chosen=$(echo "$results" | "$FZF" \
+    --height 60% --reverse \
+    --prompt "🎵 local > " \
+    --header "ENTER play · ESC cancel" \
+    --with-nth=2 --delimiter=$'\t' \
+    --preview 'echo {} | awk -F"\t" "{print \"File:\", \$1, \"\nTitle:\", \$2, \"\nArtist:\", \$3}"' \
+    --preview-window=down:3:wrap)
+
+  [[ -z "$chosen" ]] && { _warn "cancelled"; return; }
+  local filepath; filepath=$(printf '%s' "$chosen" | awk -F'\t' '{print $1}')
+  [[ -f "$filepath" ]] || { _err "file not found: $filepath"; return 1; }
+
+  _start
+  _silent '{"command":["playlist-clear"]}'
+  _ipc_loadfile "$filepath" "replace"
+  local title; title=$(_wait_title "$filepath" 15)
+  _ok "▶  ${title:-$(basename "$filepath")}"
+}
+
+# ── v5-V — m reload-config: hot-reload without killing daemon ────────────────
+do_reload_config() {
+  [ -f "$CONFIG_FILE" ] || { _warn "no config file at: $CONFIG_FILE"; return; }
+  source "$CONFIG_FILE"
+  _validate_config
+  _ok "config reloaded from: $CONFIG_FILE"
+  _info "note: daemon audio settings (device, volume) require m stop && m start to apply"
+}
+
+# ── cast (stub with documentation) ──────────────────────────────────────────
+do_cast() {
+  _info "casting via mpv --ao:"
+  echo ""
+  if [[ "$OS" == "mac" ]]; then
+    echo "  macOS: use 'coreaudio' or AirPlay via system audio routing"
+    echo "  List devices: m devices"
+  else
+    echo "  Linux: use PulseAudio/PipeWire sink routing"
+    echo "  Set device: m devices  then  m sp / m hp"
+  fi
+  echo ""
+  echo "  For Chromecast: install castnow (npm) or use mkchromecast"
+  echo "  Example: yt-dlp -g \"\$(m now | grep URL)\" | castnow --toStdin"
+  echo ""
+}
+
+# ── m doctor ─────────────────────────────────────────────────────────────────
+do_doctor() {
+  echo ""
+  echo "  ${C}m doctor — system diagnostics (v5)${X}"
+  echo "  $(date)"
+  echo ""
+  echo "  ${W}Dependencies:${X}"
+  for bin_var in YTDLP MPV FZF SOCAT JQ CURL CHAFA FFPROBE; do
+    local bin_path="${(P)bin_var}"
+    if [[ -n "$bin_path" && -x "$bin_path" ]]; then
+      local ver=""
+      case "$bin_var" in
+        YTDLP)   ver=$("$bin_path" --version 2>/dev/null | head -1) ;;
+        MPV)     ver=$("$bin_path" --version 2>/dev/null | head -1 | awk '{print $1,$2,$3}') ;;
+        FZF)     ver=$("$bin_path" --version 2>/dev/null | head -1) ;;
+        SOCAT)   ver=$("$bin_path" -V 2>&1 | head -1 | awk '{print $1,$2}') ;;
+        JQ)      ver=$("$bin_path" --version 2>/dev/null | head -1) ;;
+        CURL)    ver=$("$bin_path" --version 2>/dev/null | head -1) ;;
+        CHAFA)   ver=$("$bin_path" --version 2>/dev/null | head -1) ;;
+        FFPROBE) ver=$("$bin_path" -version 2>/dev/null | head -1) ;;
+      esac
+      printf "  ${G}✔${X}  %-8s  %s\n" "$bin_var" "${ver:-unknown version}"
+    else
+      local optional=""
+      [[ "$bin_var" == "CURL" || "$bin_var" == "CHAFA" || "$bin_var" == "FFPROBE" ]] && optional=" (optional)"
+      printf "  ${Y}–${X}  %-8s  ${Y}not found${X}%s\n" "$bin_var" "$optional"
+    fi
+  done
+  echo ""
+
+  # API keys status
+  echo "  ${W}API Keys:${X}"
+  printf "  YOUTUBE_API_KEY:   %s\n" "${YOUTUBE_API_KEY:+✔ set (fast API search enabled)}"
+  printf "  INVIDIOUS_HOST:    %s\n" "${INVIDIOUS_HOST:+✔ set (Invidious search enabled)}"
+  printf "  LASTFM_API_KEY:    %s\n" "${LASTFM_API_KEY:+✔ set (real similar tracks enabled)}"
+  printf "  SCROBBLE_URL:      %s\n" "${SCROBBLE_URL:+✔ set}"
+  [[ -z "$YOUTUBE_API_KEY$INVIDIOUS_HOST" ]] && \
+    printf "  ${Y}→ tip: set YOUTUBE_API_KEY or INVIDIOUS_HOST in config for instant search${X}\n"
+  echo ""
+
+  echo "  ${W}Daemon:${X}"
+  if [ ! -S "$SOCKET" ]; then
+    printf "  ${R}✖${X}  socket: not present  (%s)\n" "$SOCKET"
+  else
+    printf "  ${G}✔${X}  socket: exists  (%s)\n" "$SOCKET"
+    if echo '{"command":["get_version"]}' \
+        | "$SOCAT" -t 2 - "$SOCKET" >/dev/null 2>&1; then
+      printf "  ${G}✔${X}  IPC: responsive\n"
+      local title; title=$(_get media-title 2>/dev/null)
+      if [[ -n "$title" ]]; then
+        local paused; paused=$(_get pause 2>/dev/null)
+        local vol; vol=$(_get volume 2>/dev/null | awk '{printf "%.0f",$1}')
+        printf "  ${G}✔${X}  now playing: %s  (paused=%s  vol=%s%%)\n" "$title" "$paused" "$vol"
+      else
+        printf "  ${C}→${X}  idle (no track loaded)\n"
+      fi
+    else
+      printf "  ${R}✖${X}  IPC: unresponsive — run: m stop && m start\n"
+    fi
+  fi
+  echo ""
+
+  echo "  ${W}Lock files:${X}"
+  if [ -d "$LOCK_FILE_D" ]; then
+    local lock_pid; lock_pid=$(cat "$LOCK_FILE" 2>/dev/null || echo "")
+    if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
+      printf "  ${Y}⚠${X}  start.lock held by PID %s (live)\n" "$lock_pid"
+    else
+      printf "  ${R}✖${X}  start.lock STALE (PID %s dead) — run: m stop\n" "${lock_pid:-unknown}"
+    fi
+  else
+    printf "  ${G}✔${X}  no stale locks\n"
+  fi
+  echo ""
+
+  echo "  ${W}Data files:${X}"
+  local history_lines=0 likes_lines=0 bm_lines=0
+  [ -f "$HISTORY_FILE" ] && history_lines=$(wc -l < "$HISTORY_FILE" | tr -d ' ')
+  [ -f "$LIKES_FILE"   ] && likes_lines=$(wc -l < "$LIKES_FILE"   | tr -d ' ')
+  [ -f "$BOOKMARKS_FILE" ] && bm_lines=$(wc -l < "$BOOKMARKS_FILE" | tr -d ' ')
+  printf "  history:   %s entries\n" "$history_lines"
+  printf "  likes:     %s entries\n" "$likes_lines"
+  printf "  bookmarks: %s entries\n" "$bm_lines"
+  if [ -f "$LOCAL_INDEX" ]; then
+    printf "  local lib: %s tracks indexed\n" "$(wc -l < "$LOCAL_INDEX" | tr -d ' ')"
+  fi
+  echo ""
+
+  echo "  ${W}Cache:${X}"
+  local cache_total=0 cache_expired=0
+  for f in "$CACHE_DIR"/*.cache(N); do
+    cache_total=$(( cache_total + 1 ))
+    [ "$(_cache_age "$f")" -ge "$CACHE_TTL" ] && cache_expired=$(( cache_expired + 1 ))
+  done
+  printf "  %s total  |  %s fresh  |  %s expired  |  TTL: %ss\n" \
+    "$cache_total" "$(( cache_total - cache_expired ))" "$cache_expired" "$CACHE_TTL"
+  echo ""
+}
+
+do_update() {
+  _info "updating yt-dlp..."
+  local old_ver; old_ver=$("$YTDLP" --version 2>/dev/null | head -1)
+  local rc=0
+  if [[ "$OS" == "mac" ]]; then
+    if command -v brew >/dev/null 2>&1; then brew upgrade yt-dlp 2>&1 || rc=$?
+    else "$YTDLP" -U 2>&1 || rc=$?; fi
+  else
+    if command -v pip3 >/dev/null 2>&1; then pip3 install -U yt-dlp 2>&1 || rc=$?
+    elif command -v pip >/dev/null 2>&1; then pip install -U yt-dlp 2>&1 || rc=$?
+    else "$YTDLP" -U 2>&1 || rc=$?; fi
+  fi
+  [[ $rc -ne 0 ]] && _warn "update may have failed (exit $rc)"
+  local new_ver; new_ver=$("$YTDLP" --version 2>/dev/null | head -1)
+  if [[ "$old_ver" != "$new_ver" ]]; then _ok "yt-dlp updated: ${old_ver} → ${new_ver}"
+  else _ok "yt-dlp already up-to-date: ${new_ver}"; fi
+  rm -f "$CACHE_DIR/.ytdlp_version_check"
+}
+
+do_log() {
+  if [[ ! -s "$MPV_LOG" ]]; then _info "mpv log is empty: $MPV_LOG"; return; fi
+  echo ""; echo "  ${C}mpv log:${X}  $MPV_LOG"; echo ""
+  tail -50 "$MPV_LOG"; echo ""
+}
+
+do_log_clear() { > "$MPV_LOG"; _ok "mpv log cleared"; }
+
+do_cache_clear() {
+  local count; count=$(ls "$CACHE_DIR"/*.cache 2>/dev/null | wc -l | tr -d ' ')
+  rm -f "$CACHE_DIR"/*.cache
+  _ok "cleared ${count} cached search(es)"
+}
+
+do_cache_stats() {
+  local total=0 expired=0 fresh=0
+  for f in "$CACHE_DIR"/*.cache(N); do
+    total=$(( total + 1 ))
+    if [ "$(_cache_age "$f")" -ge "$CACHE_TTL" ]; then expired=$(( expired + 1 ))
+    else fresh=$(( fresh + 1 )); fi
+  done
+  echo ""; echo "  ${C}cache stats:${X}"
+  echo "  total:   ${total}"; echo "  fresh:   ${G}${fresh}${X}  (TTL: ${CACHE_TTL}s)"
+  echo "  expired: ${Y}${expired}${X}"; echo "  dir:     $CACHE_DIR"; echo ""
+}
+
+do_cache_prune() {
+  local count=0
+  for f in "$CACHE_DIR"/*.cache(N); do
+    [[ -f "$f" ]] || continue
+    if [ "$(_cache_age "$f")" -ge "$CACHE_TTL" ]; then rm -f "$f"; count=$(( count + 1 )); fi
+  done
+  _ok "pruned ${count} expired cache entrie(s)"
+}
+
+do_devices() {
+  echo ""; echo "  ${C}audio devices:${X}"
+  "$MPV" --audio-device=help 2>&1 | grep "'" | sed 's/^/  /'
+  echo ""
+  echo "  current:     ${W}$(_get audio-device)${X}"
+  echo "  speakers:    ${W}${AUDIO_DEVICE_SPEAKERS:-not configured}${X}"
+  echo "  headphones:  ${W}${AUDIO_DEVICE_HEADPHONES:-not configured}${X}"
+  echo "  (set in: $CONFIG_FILE)"; echo ""
+}
+
+# ── Plugin system (v5) ────────────────────────────────────────
+_load_plugins() {
+  [[ -d "$PLUGINS_DIR" ]] || return
+  for plugin in "$PLUGINS_DIR"/*.zsh(N); do
+    source "$plugin" 2>/dev/null && _info "plugin loaded: $(basename "$plugin")" || \
+      _warn "plugin error: $(basename "$plugin")"
+  done
+}
+_load_plugins
+
+# ── Phase 2.1: Custom equalizer bands ───────────────────────────
+do_eq_custom() {
+  _need
+  shift  # consume "eq"
+  shift  # consume "custom"
+  if [[ $# -lt 2 ]] || (( $# % 2 != 0 )); then
+    _err "usage: m eq custom <freq1> <gain1> [freq2 gain2 ...]  e.g. m eq custom 60 +8 200 -3 8000 +5"
+    return 1
+  fi
+  local -a bands
+  bands=()
+  while [[ $# -ge 2 ]]; do
+    local freq="$1" gain="$2"
+    shift 2
+    [[ "$freq" =~ ^[0-9]+$ ]] || { _err "invalid frequency: $freq"; return 1; }
+    [[ "$gain" =~ ^[+-]?[0-9]+(\.[0-9]+)?$ ]] || { _err "invalid gain: $gain"; return 1; }
+    bands+=("equalizer=f=${freq}:t=h:w=200:g=${gain}")
+  done
+  local af="lavfi=[${(j:,:)bands}]"
+  _af_set "$af"
+  _ok "🎚  custom equalizer: ${#bands[@]} band(s)"
+}
+
+# ── Phase 2.2: Crossfade between tracks ─────────────────────────
+do_crossfade() {
+  local secs="${1:-}"
+  if [[ -z "$secs" ]]; then
+    _info "crossfade: ${CROSSFADE_SECS:-0}s  (set in config: CROSSFADE_SECS)"
+    return
+  fi
+  [[ "$secs" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { _err "usage: m crossfade <seconds>"; return 1; }
+  # Persist to config file
+  if grep -q '^CROSSFADE_SECS=' "$CONFIG_FILE" 2>/dev/null; then
+    sed -i.bak "s/^CROSSFADE_SECS=.*/CROSSFADE_SECS=$secs/" "$CONFIG_FILE" 2>/dev/null || \
+      sed -i '' "s/^CROSSFADE_SECS=.*/CROSSFADE_SECS=$secs/" "$CONFIG_FILE" 2>/dev/null
+  else
+    echo "CROSSFADE_SECS=$secs" >> "$CONFIG_FILE"
+  fi
+  CROSSFADE_SECS="$secs"
+  _ok "crossfade set to ${secs}s  (requires m stop && m start to apply)"
+}
+
+# ── Phase 2.3: Remove duplicate URLs from queue ─────────────────
+do_queue_dedup() {
+  _need
+  local raw pl_count
+  raw=$(_cmd '{"command":["get_property","playlist"]}')
+  pl_count=$(echo "$raw" | "$JQ" '.data|length' 2>/dev/null || echo 0)
+  [[ "$pl_count" -eq 0 ]] && { _warn "queue empty"; return; }
+  local -a urls seen
+  urls=($(echo "$raw" | "$JQ" -r '.data[].filename // empty' 2>/dev/null))
+  seen=()
+  local i=0 removed=0
+  while [[ $i -lt ${#urls[@]} ]]; do
+    local url="${urls[$i]}"
+    if [[ -n "$url" ]] && (( ${#seen[@]} > 0 )); then
+      local dup=0
+      for u in "${seen[@]}"; do
+        [[ "$u" == "$url" ]] && { dup=1; break; }
+      done
+      if [[ $dup -eq 1 ]]; then
+        _silent "{\"command\":[\"playlist-remove\",$((i - removed))]}"
+        removed=$(( removed + 1 ))
+        (( i++ ))
+        continue
+      fi
+    fi
+    [[ -n "$url" ]] && seen+=("$url")
+    (( i++ ))
+  done
+  [[ $removed -eq 0 ]] && _ok "no duplicates found" || _ok "removed ${removed} duplicate(s)"
+}
+
+# ── Phase 2.4: Pin tracks by name ───────────────────────────────
+do_pin() {
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    _err "usage: m pin <name>  — pin current track, or play pinned track if name exists"
+    return 1
+  fi
+  name=$(printf '%s' "$name" | tr ' ' '_' | tr -cd '[:alnum:]_-')
+  [[ -z "$name" ]] && { _err "invalid pin name"; return 1; }
+  # Check if pin exists — play it
+  if awk -F'\t' -v n="$name" '$1==n {exit 0} END{exit 1}' "$PINS_FILE" 2>/dev/null; then
+    local url title
+    url=$(awk -F'\t' -v n="$name" '$1==n {print $2; exit}' "$PINS_FILE")
+    title=$(awk -F'\t' -v n="$name" '$1==n {print $3; exit}' "$PINS_FILE")
+    [[ -z "$url" ]] && { _err "could not read pin: $name"; return 1; }
+    _start
+    _silent '{"command":["playlist-clear"]}'
+    _ipc_loadfile "$url" "replace"
+    _ok "▶  ${title:-$name}"
+    return
+  fi
+  # Pin current track
+  _need
+  local cur_url cur_title
+  cur_url=$(_get path)
+  cur_title=$(_get media-title)
+  [[ -z "$cur_url" ]] && { _err 4 "nothing playing — play something first to pin"; return 1; }
+  cur_url=$(_clean_url "$cur_url")
+  # Remove existing pin with same name
+  local tmpf; tmpf=$(mktemp "$PINS_FILE.XXXXXX")
+  awk -F'\t' -v n="$name" '$1!=n' "$PINS_FILE" 2>/dev/null > "$tmpf" || true
+  printf '%s\t%s\t%s\n' "$name" "$cur_url" "${cur_title:-unknown}" >> "$tmpf"
+  mv "$tmpf" "$PINS_FILE"
+  _ok "📌 pinned: ${name} → ${cur_title:-unknown}"
+}
+
+do_pins() {
+  [[ ! -s "$PINS_FILE" ]] && { _info "no pins yet — use: m pin <name> while playing"; return; }
+  echo ""
+  echo "  ${C}📌 pins${X}"
+  echo ""
+  awk -F'\t' '{printf "  %-20s  %s\n", $1, $3}' "$PINS_FILE" | sed 's/^/  /'
+  echo ""
+}
+
+# ── Phase 2.5: Auto-save queue ──────────────────────────────────
+do_queue_save_auto() {
+  if [[ -f "$QUEUE_SAVE_AUTO_FILE" ]]; then
+    rm -f "$QUEUE_SAVE_AUTO_FILE"
+    _ok "auto-save queue: OFF"
+  else
+    touch "$QUEUE_SAVE_AUTO_FILE"
+    _ok "auto-save queue: ON  (saves to $AUTOSAVE_QUEUE_FILE)"
+  fi
+}
+
+# ── Phase 2.6: Search without playing ───────────────────────────
+do_search_only() {
+  local query="${*:-}"
+  [[ -z "$query" ]] && { _err "usage: m search <query>"; return 1; }
+  local results
+  results=$(_do_search "$query") || { _err 5 "search failed"; return 1; }
+  [[ -z "$results" ]] && { _warn "no results for: $query"; return; }
+  echo ""
+  echo "  ${C}search: ${query}${X}"
+  echo ""
+  echo "$results" | awk -F ' \| ' '{printf "  %-50s %8s  %s\n", substr($1,1,50), $2, $3}' | head -30
+  echo ""
+}
+
+# ── Phase 2.7: Internet radio ────────────────────────────────────
+do_radio() {
+  local genre="${1:-}"
+  [[ ! -f "$STATIONS_FILE" ]] && { _err "create $STATIONS_FILE (genre\tname\turl per line)"; return 1; }
+  [[ ! -s "$STATIONS_FILE" ]] && { _err "stations file empty"; return 1; }
+  local stations_content
+  stations_content=$(grep -v '^#' "$STATIONS_FILE" 2>/dev/null | grep -v '^[[:space:]]*$')
+  [[ -z "$stations_content" ]] && { _err "no stations (add entries to $STATIONS_FILE)"; return 1; }
+  local chosen
+  if [[ -n "$genre" ]]; then
+    chosen=$(echo "$stations_content" | grep -i "^${genre}"$'\t' 2>/dev/null | head -1)
+    [[ -z "$chosen" ]] && chosen=$(echo "$stations_content" | "$FZF" --height 40% --reverse --prompt "🎵 radio > " \
+      -q "$genre" 2>/dev/null)
+  else
+    chosen=$(echo "$stations_content" | "$FZF" --height 40% --reverse --prompt "🎵 radio > " \
+      --header "ENTER play · ESC cancel" \
+      --with-nth=1,2 --delimiter=$'\t' 2>/dev/null)
+  fi
+  [[ -z "$chosen" ]] && { _warn "cancelled"; return; }
+  local url; url=$(echo "$chosen" | awk -F'\t' '{print $3}')
+  [[ -z "$url" ]] && { _err "invalid station line"; return 1; }
+  _start
+  _silent '{"command":["playlist-clear"]}'
+  _ipc_loadfile "$url" "replace"
+  local name; name=$(echo "$chosen" | awk -F'\t' '{print $2}')
+  _ok "📻 ▶  ${name:-unknown}"
+}
+
+# ── Phase 2.9: Chapter navigation ──────────────────────────────
+do_chapter() {
+  _need
+  local path; path=$(_get path)
+  [[ -z "$path" ]] && { _err 4 "nothing playing"; return 1; }
+  [[ "$path" != *youtube* && "$path" != *youtu.be* ]] && { _warn "chapters only for YouTube videos"; return; }
+  local chapters
+  chapters=$("$YTDLP" --dump-json --no-download "$path" 2>/dev/null | \
+    "$JQ" -r '.chapters[]? | "\(.start_time // 0)\t\(.title // "untitled")"' 2>/dev/null)
+  [[ -z "$chapters" ]] && { _warn "no chapters in this video"; return; }
+  local chosen
+  chosen=$(echo "$chapters" | "$FZF" --height 50% --reverse \
+    --prompt "⏱ chapter > " --header "ENTER jump · ESC cancel" \
+    --with-nth=2 --delimiter=$'\t')
+  [[ -z "$chosen" ]] && { _warn "cancelled"; return; }
+  local secs; secs=$(echo "$chosen" | awk -F'\t' '{print $1}')
+  [[ -z "$secs" ]] && return
+  _silent "{\"command\":[\"seek\",\"$secs\",\"absolute\"]}"
+  _ok "jumped to chapter: $(echo "$chosen" | awk -F'\t' '{print $2}')"
+}
+
+# ── Phase 2.10: Listening statistics ───────────────────────────
+do_stats() {
+  [[ ! -s "$HISTORY_FILE" ]] && { _warn "no history yet"; return; }
+  echo ""
+  echo "  ${C}listening stats${X}"
+  echo ""
+  local total unique most top
+  total=$(wc -l < "$HISTORY_FILE" | tr -d ' ')
+  unique=$(awk -F'\t' '!seen[$3]++ {c++} END{print c+0}' "$HISTORY_FILE")
+  most=$(awk -F'\t' '{count[$3]++} END{for(u in count) if(count[u]>max){max=count[u];best=u} print best}' "$HISTORY_FILE")
+  local most_count
+  most_count=$(awk -F'\t' -v u="$most" '$3==u {c++} END{print c+0}' "$HISTORY_FILE")
+  local most_title
+  most_title=$(awk -F'\t' -v u="$most" '$3==u {print $2; exit}' "$HISTORY_FILE")
+  echo "  total plays:  ${total}"
+  echo "  unique:       ${unique}"
+  echo "  most played:  ${most_title:-$most}  (${most_count}x)"
+  echo ""
+  echo "  ${W}top 10:${X}"
+  awk -F'\t' '{count[$3]++; title[$3]=$2} END{for(u in count) print count[u]"\t"title[u]"\t"u}' "$HISTORY_FILE" | \
+    sort -rn | head -10 | while IFS=$'\t' read -r c t u; do echo "  ${c}x  ${t}"; done
+  echo ""
+}
+
+# ── Phase 2.12: Edit config in $EDITOR ──────────────────────────
+do_config_edit() {
+  [[ -z "${EDITOR:-}" ]] && EDITOR="${VISUAL:-vi}"
+  [[ -z "$EDITOR" ]] && { _err "EDITOR not set"; return 1; }
+  "$EDITOR" "$CONFIG_FILE"
+  _ok "edited: $CONFIG_FILE  (run: m reload-config to apply)"
+}
+
+# ── Phase 2.14: Desktop notification toggle ──────────────────────
+do_notify_toggle() {
+  if [[ "$NOTIFY_ENABLED" == "1" ]]; then
+    # Persist to config
+    if grep -q '^NOTIFY_ENABLED=' "$CONFIG_FILE" 2>/dev/null; then
+      sed -i.bak 's/^NOTIFY_ENABLED=.*/NOTIFY_ENABLED=0/' "$CONFIG_FILE" 2>/dev/null || \
+        sed -i '' 's/^NOTIFY_ENABLED=.*/NOTIFY_ENABLED=0/' "$CONFIG_FILE" 2>/dev/null
+    fi
+    NOTIFY_ENABLED=0
+    _ok "notifications: OFF"
+  else
+    if grep -q '^NOTIFY_ENABLED=' "$CONFIG_FILE" 2>/dev/null; then
+      sed -i.bak 's/^NOTIFY_ENABLED=.*/NOTIFY_ENABLED=1/' "$CONFIG_FILE" 2>/dev/null || \
+        sed -i '' 's/^NOTIFY_ENABLED=.*/NOTIFY_ENABLED=1/' "$CONFIG_FILE" 2>/dev/null
+    else
+      echo "NOTIFY_ENABLED=1" >> "$CONFIG_FILE"
+    fi
+    NOTIFY_ENABLED=1
+    _ok "notifications: ON"
+  fi
+}
+
+# ── Phase 2.15: History with play counts ─────────────────────────
+do_history_stats() {
+  [[ ! -s "$HISTORY_FILE" ]] && { _warn "no history yet"; return; }
+  local with_counts
+  with_counts=$(awk -F'\t' '{count[$3]++; title[$3]=$2; date[$3]=$1} END{for(u in count) print count[u]"\t"date[u]"\t"title[u]"\t"u}' "$HISTORY_FILE" | sort -rn)
+  local line url
+  line=$(echo "$with_counts" | "$FZF" --height 60% --reverse \
+    --prompt "🕑 history (count) > " \
+    --header "ENTER replay · ESC cancel" \
+    --with-nth=1,2,3 --delimiter=$'\t' \
+    --preview 'echo {} | awk -F"\t" "{printf \"Plays: %s\nDate:  %s\nTitle: %s\nURL:   %s\n\",\$1,\$2,\$3,\$4}"' \
+    --preview-window=down:4:wrap)
+  [[ -z "$line" ]] && { _warn "cancelled"; return; }
+  url=$(echo "$line" | awk -F'\t' '{print $4}')
+  [[ -z "$url" ]] && { _err "could not extract URL"; return 1; }
+  _start
+  _silent '{"command":["playlist-clear"]}'
+  _ipc_loadfile "$url" "replace"
+  local title; title=$(echo "$line" | awk -F'\t' '{print $3}')
+  _ok "▶  ${title:-playing}"
+}
+
+# ── Phase 5.3: Shell completions ────────────────────────────────
+do_completions() {
+  cat <<'COMPLETIONS'
+# m — zsh completion
+_m_completions() {
+  local -a cmds
+  cmds=(pause next prev stop start shuffle repeat repeat-one clear now bar lyrics art ui uxi uxi-stop scrub queue qmove qrm status hp speakers devices playlists save load pldel import dl dl-list txt txts txtnext txtprev txtnow txtpick txtedit txt-export vol seek speed like unlike likes likes-play love similar history history-clear replay eq eq\ custom norm sleep export update doctor queue-restore log log-clear cache-clear cache-prune cache-stats autodj bookmark bookmarks bookmark-load index local reload-config crossfade queue-dedup pin pins queue-save-auto search radio chapter stats config-edit notify-toggle history-stats completions help)
+  _describe 'm' cmds
+}
+compdef _m_completions m
+COMPLETIONS
+}
+
+# ── help ──────────────────────────────────────────────────────
+do_help() {
+  cat <<EOF
+
+  ${C}m — terminal music CLI${X}   (v6 "God Tier")
+  data: ~/music_system/   config: $CONFIG_FILE
+  log:  $MPV_LOG
+
+  ${W}SPEED UP SEARCH${X}
+    Set in $CONFIG_FILE:
+      YOUTUBE_API_KEY=...   → instant search via YouTube Data API (milliseconds)
+      INVIDIOUS_HOST=...    → privacy-friendly Invidious API (fast, no key needed)
+      (default: yt-dlp scrape, 2–5s)
+
+  ${W}PLAY${X}
+    m "query"              search YouTube & play (fzf picker)
+    m ~/path/to/file.mp3   play a local file directly
+    m "query" -a           add to queue (dedup-guarded)
+    m "query" -a -f        force-add (bypass dedup)
+    m "query" -an          add as next track (play after current)
+    m "query" -hp          play via headphones
+    m "query" -sp          play via speakers
+
+  ${W}TRANSPORT${X}
+    pause / pp             toggle pause
+    next  / mn             next track
+    prev  / mb             previous track
+    seek +30               seek forward 30s (shows mini progress bar)
+    seek -15               seek back 15s
+    seek 1:30              jump to 1m30s
+    seek 90                jump to 90s
+    speed 1.5              set playback speed (0.25–4.0)
+    speed + / - / r        step speed / reset to 1x
+    stop                   kill daemon
+    start                  start daemon
+
+  ${W}VOLUME & OUTPUT${X}
+    vol / vol 80 / vol + / vol -   show/set/step volume (0-150)
+    hp / headphones        switch to headphones
+    sp / speakers          switch to speakers
+    devices                list audio devices
+
+  ${W}AUDIO FILTERS${X}
+    eq [flat|bass|treble|vocal|loud]   equalizer preset
+    eq custom <freq> <gain> [...]     custom EQ bands (e.g. eq custom 60 +8 200 -3 8000 +5)
+    norm                   toggle loudness normalisation
+    crossfade <secs>      set crossfade duration (CROSSFADE_SECS in config)
+
+  ${W}INFO & UI${X}
+    now                    current track + position
+    bar / progress         live progress bar (p/n/b/seek/vol/r/l=lyrics/q)
+    lyrics                 real-time synced lyrics (lrclib.net, no key needed)
+    art                    terminal album art (requires chafa)
+    ui                     unified TUI dashboard (requires tmux)
+    uxi                    launch synced web UI dashboard (auto-starts bridge server)
+    uxi-stop               stop the uxi bridge server
+    scrub / slider         interactive seek slider
+    queue                  show queue
+    status                 daemon status + all state
+
+  ${W}QUEUE MANAGEMENT${X}
+    shuffle                shuffle queue
+    repeat / rp            toggle repeat-playlist
+    repeat-one / ro        toggle repeat-one
+    clear                  clear queue
+    qmove <from> <to>      move track (1-based)
+    qrm <pos>              remove track (1-based)
+    queue-restore / qr     restore queue from auto-snapshot
+    queue-dedup            remove duplicate URLs from queue
+    queue-save-auto        toggle auto-save queue to autosave_queue.m3u
+
+  ${W}BOOKMARKS (v5)${X}
+    bookmark [name]        save current track+position as named bookmark
+    bookmarks              list all bookmarks
+    bookmark-load / bl     fzf-pick and restore a bookmark
+
+  ${W}AUTO-DJ (v5)${X}
+    autodj                 toggle Auto-DJ (auto-refills queue from Last.fm)
+                           set LASTFM_API_KEY for real recommendations
+
+  ${W}LIKES${X}
+    like / unlike / likes  like current track / remove / list
+    likes-play / lp        fzf-pick & play a liked track
+    love                   play random liked track (reservoir sampling)
+
+  ${W}HISTORY${X}
+    history                fuzzy-search & replay history (dedup on last 50)
+    history-stats          history picker with play counts
+    history-clear          wipe history
+    replay / rl            replay the last played track
+    similar                add similar track (Last.fm or YouTube)
+    stats                  listening stats (total, unique, most played, top 10)
+
+  ${W}TXT PLAYLISTS${X}
+    txts                   list all txt playlists
+    txt [name] [--resume]  load txt playlist (v5: parallel resolution, resume)
+    txtnext / tn           next song in txt playlist
+    txtprev / tp           previous song
+    txtnow                 show active txt + context
+    txtpick / tj           fzf-jump to any song in txt
+    txtedit [name]         edit/create txt file in \$EDITOR
+    txt-export             resolve active txt → saved m3u
+
+  ${W}QUEUE PLAYLISTS${X}
+    save <n>               save current queue as playlist
+    load <n>               load playlist (O(1) dedup)
+    playlists / pls        list saved playlists
+    pldel <n>              delete playlist
+
+  ${W}LOCAL LIBRARY (v5)${X}
+    index                  scan \$LOCAL_MUSIC_DIR with ffprobe, build index
+    local [query]          fzf-search & play from local library
+
+  ${W}DOWNLOAD & IMPORT${X}
+    dl "query"             download as MP3 (progress visible)
+    dl-list                list downloaded files
+    import "url"           import YouTube playlist
+
+  ${W}SLEEP TIMER${X}
+    sleep <minutes> / sleep cancel   sleep timer
+
+  ${W}EXPORT${X}
+    export [likes|history]   print as CSV (CSV injection safe)
+
+  ${W}PINS${X}
+    pin <name>             pin current track, or play pinned track if name exists
+    pins                   list all pins
+
+  ${W}SEARCH & RADIO${X}
+    search <query>         search without playing (table display)
+    radio [genre]          internet radio from \$MUSIC_ROOT/stations.tsv
+
+  ${W}VIDEO${X}
+    chapter                show YouTube chapters, jump to chapter (fzf)
+
+  ${W}CONFIG${X}
+    config-edit            edit config in \$EDITOR
+    reload-config          hot-reload config without restarting daemon
+    notify-toggle          toggle desktop notifications on track change
+
+  ${W}SHELL${X}
+    completions            output zsh completion script
+
+  ${W}UPDATES & DIAGNOSTICS${X}
+    update                 update yt-dlp
+    doctor                 full diagnostics: deps, API keys, IPC, locks, cache
+    log / log-clear        mpv error log
+    cache-clear/prune/stats  cache management
+
+  ${W}SPONSORBLOCK${X}
+    Drop the mpv-sponsorblock lua script into ~/.config/mpv/scripts/ to
+    automatically skip non-music sections in YouTube videos.
+    Get it: https://github.com/po5/mpv_sponsorblock
+
+  ${W}PLUGINS${X}
+    Drop .zsh files into: $PLUGINS_DIR
+    They are sourced at startup. Define do_mycommand() functions.
+
+EOF
+}
+
+# ── main dispatch ─────────────────────────────────────────────
+_check_ytdlp_age
+
+[ $# -eq 0 ] && { do_status; exit 0; }
+
+case "$1" in
+  pause|pp)            do_pause;                   exit 0 ;;
+  next|mn)             do_next;                    exit 0 ;;
+  prev|mb)             do_prev;                    exit 0 ;;
+  stop)                do_stop;                    exit 0 ;;
+  start)               do_start;                   exit 0 ;;
+  shuffle)             do_shuffle;                 exit 0 ;;
+  repeat|rp)           do_repeat;                  exit 0 ;;
+  repeat-one|ro)       do_repeat_one;              exit 0 ;;
+  clear)               do_clear;                   exit 0 ;;
+  now)                 do_now;                     exit 0 ;;
+  bar|progress)        do_bar;                     exit 0 ;;
+  lyrics)              do_lyrics;                  exit 0 ;;
+  art)                 do_art;                     exit 0 ;;
+  ui)                  do_ui;                      exit 0 ;;
+  uxi)                 do_uxi;                     exit 0 ;;
+  uxi-stop)             do_uxi_stop;                 exit 0 ;;
+  scrub|slider)        do_scrub;                   exit 0 ;;
+  queue)               do_queue;                   exit 0 ;;
+  qmove)               do_queue_move "$2" "$3";    exit 0 ;;
+  qrm)                 do_queue_remove "$2";       exit 0 ;;
+  status)              do_status;                  exit 0 ;;
+  hp|headphones)       do_hp;                      exit 0 ;;
+  sp|speakers)         do_sp;                      exit 0 ;;
+  devices)             do_devices;                 exit 0 ;;
+  playlists|pls)       do_playlists;               exit 0 ;;
+  save)                do_save "${2:-}";           exit 0 ;;
+  load)                do_load "${2:-}";           exit 0 ;;
+  pldel)               do_playlist_del "${2:-}";   exit 0 ;;
+  import)              do_import "${2:-}";         exit 0 ;;
+  dl)                  do_dl "${2:-}";             exit 0 ;;
+  dl-list)             do_dl_list;                 exit 0 ;;
+  txt)                 do_txt "${2:-}" "${3:-}";   exit 0 ;;
+  txts)                do_txts;                    exit 0 ;;
+  txtnext|tn)          do_txtnext;                 exit 0 ;;
+  txtprev|tp)          do_txtprev;                 exit 0 ;;
+  txtnow)              do_txtnow;                  exit 0 ;;
+  txtpick|tj)          do_txtpick;                 exit 0 ;;
+  txtedit|te)          do_txtedit "${2:-}";        exit 0 ;;
+  txt-export)          do_txt_export;              exit 0 ;;
+  vol|volume)          do_vol "${2:-}";            exit 0 ;;
+  seek)                do_seek "${2:-}";           exit 0 ;;
+  speed)               do_speed "${2:-}";          exit 0 ;;
+  like)                do_like;                    exit 0 ;;
+  unlike)              do_unlike;                  exit 0 ;;
+  likes)               do_likes;                   exit 0 ;;
+  likes-play|lp)       do_likes_play;              exit 0 ;;
+  love)                do_love;                    exit 0 ;;
+  similar)             do_similar;                 exit 0 ;;
+  history|hist)        do_history;                 exit 0 ;;
+  history-clear)       do_history_clear;           exit 0 ;;
+  replay|rl)           do_replay;                  exit 0 ;;
+  eq)                  if [[ "${2:-}" == "custom" ]]; then do_eq_custom "$@"; else do_eq "${2:-}"; fi; exit 0 ;;
+  crossfade)            do_crossfade "${2:-}";     exit 0 ;;
+  queue-dedup)          do_queue_dedup;           exit 0 ;;
+  pin)                 do_pin "${2:-}";            exit 0 ;;
+  pins)                do_pins;                   exit 0 ;;
+  queue-save-auto)      do_queue_save_auto;       exit 0 ;;
+  search)              do_search_only "${*:2}"; exit 0 ;;
+  radio)               do_radio "${2:-}";         exit 0 ;;
+  chapter)              do_chapter;               exit 0 ;;
+  stats)               do_stats;                  exit 0 ;;
+  config-edit)         do_config_edit;           exit 0 ;;
+  notify-toggle)        do_notify_toggle;          exit 0 ;;
+  history-stats)       do_history_stats;          exit 0 ;;
+  completions)         do_completions;            exit 0 ;;
+  norm)                do_norm;                    exit 0 ;;
+  sleep)               do_sleep "${2:-}";          exit 0 ;;
+  export)              do_export "${2:-}";         exit 0 ;;
+  update)              do_update;                  exit 0 ;;
+  doctor)              do_doctor;                  exit 0 ;;
+  queue-restore|qr)    do_queue_restore;           exit 0 ;;
+  log)                 do_log;                     exit 0 ;;
+  log-clear)           do_log_clear;               exit 0 ;;
+  cache-clear)         do_cache_clear;             exit 0 ;;
+  cache-prune)         do_cache_prune;             exit 0 ;;
+  cache-stats)         do_cache_stats;             exit 0 ;;
+  autodj)              do_autodj;                  exit 0 ;;
+  bookmark)            do_bookmark "${2:-}";       exit 0 ;;
+  bookmarks)           do_bookmarks;               exit 0 ;;
+  bookmark-load|bl)    do_bookmark_load;           exit 0 ;;
+  index)               do_index;                   exit 0 ;;
+  local)               do_local "${2:-}";          exit 0 ;;
+  reload-config)       do_reload_config;           exit 0 ;;
+  cast)                do_cast;                    exit 0 ;;
+  help|-h|--help)      do_help;                    exit 0 ;;
+esac
+
+# ── Free-form query with optional flags ───────────────────────
+typeset -a QUERY_ARGS
+QUERY_ARGS=()
+FLAG_ADD=0
+FLAG_FORCE=0
+FLAG_NEXT=0
+FLAG_HP=0
+FLAG_SP=0
+
+for arg in "$@"; do
+  case "$arg" in
+    -a|--add)          FLAG_ADD=1 ;;
+    -f|--force)        FLAG_FORCE=1 ;;
+    -an|--add-next)    FLAG_ADD=1; FLAG_NEXT=1 ;;
+    -hp|--headphones)  FLAG_HP=1 ;;
+    -sp|--speakers)    FLAG_SP=1 ;;
+    -*)                _die "unknown flag: $arg  (run: m help)" ;;
+    *)                 QUERY_ARGS+=("$arg") ;;
+  esac
+done
+
+[ ${#QUERY_ARGS[@]} -eq 0 ] && _die "no query — usage: m \"song name\"  or  m help"
+
+QUERY="${(j: :)QUERY_ARGS}"
+
+if [ $FLAG_ADD -eq 1 ]; then
+  if [ $FLAG_NEXT -eq 1 ]; then
+    do_add_next "$QUERY"
+  elif [ $FLAG_FORCE -eq 1 ]; then
+    do_add_force "$QUERY"
+  else
+    do_add "$QUERY"
+  fi
+else
+  do_play "$QUERY"
+fi
+
+[ $FLAG_HP -eq 1 ] && sleep 0.4 && do_hp
+[ $FLAG_SP -eq 1 ] && sleep 0.4 && do_sp

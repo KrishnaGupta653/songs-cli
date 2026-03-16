@@ -1,0 +1,1402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>m — music</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=DM+Serif+Display:ital@0;1&display=swap');
+
+  :root, [data-theme="dark"] {
+    --bg: #0a0a0b;
+    --surface: #111114;
+    --surface2: #18181d;
+    --border: #2a2a35;
+    --accent: #c8ff5a;
+    --accent2: #5affdc;
+    --accent3: #ff5a8c;
+    --text: #e8e8f0;
+    --muted: #555566;
+    --dim: #333340;
+  }
+
+  [data-theme="light"] {
+    --bg: #f5f5f7;
+    --surface: #ffffff;
+    --surface2: #e8e8ec;
+    --border: #d1d1d6;
+    --accent: #2d8a00;
+    --accent2: #008a6e;
+    --accent3: #c41e3a;
+    --text: #1d1d1f;
+    --muted: #6e6e73;
+    --dim: #aeaeb2;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Space Mono', monospace;
+    min-height: 100vh;
+    overflow-x: hidden;
+    transition: background 0.3s, color 0.3s;
+  }
+
+  /* Grain overlay */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.04'/%3E%3C/svg%3E");
+    pointer-events: none;
+    z-index: 100;
+    opacity: 0.4;
+  }
+
+  .layout {
+    display: grid;
+    grid-template-columns: 320px 1fr;
+    grid-template-rows: auto 1fr auto;
+    min-height: 100vh;
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 24px;
+    gap: 16px;
+  }
+
+  /* ── HEADER ── */
+  .header {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+
+  .logo {
+    font-family: 'DM Serif Display', serif;
+    font-size: 28px;
+    letter-spacing: -1px;
+    color: var(--accent);
+  }
+
+  .logo span { color: var(--muted); font-size: 14px; font-family: 'Space Mono', monospace; margin-left: 12px; }
+
+  .header-right {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  .theme-toggle {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 6px 10px;
+    cursor: pointer;
+    font-size: 18px;
+    transition: all 0.15s;
+    color: var(--text);
+  }
+  .theme-toggle:hover { background: var(--border); }
+
+  .status-badge {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 11px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 2px;
+  }
+
+  .status-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--accent);
+    animation: pulse 2s ease-in-out infinite;
+  }
+
+  .status-dot.connecting {
+    background: var(--accent2);
+    animation: pulse 2s ease-in-out infinite;
+  }
+
+  .status-dot.offline {
+    background: var(--accent3);
+    animation: none;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(200,255,90,0.4); }
+    50% { opacity: 0.7; box-shadow: 0 0 0 6px rgba(200,255,90,0); }
+  }
+
+  /* ── SIDEBAR ── */
+  .sidebar {
+    grid-row: 2;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  /* ── MAIN ── */
+  .main {
+    grid-row: 2;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  /* ── CARD ── */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .card-label {
+    font-size: 10px;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 16px;
+  }
+
+  /* ── NOW PLAYING ── */
+  .now-playing {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .now-playing::before {
+    content: '';
+    position: absolute;
+    top: -40px; right: -40px;
+    width: 200px; height: 200px;
+    background: radial-gradient(circle, rgba(200,255,90,0.06) 0%, transparent 70%);
+    pointer-events: none;
+  }
+
+  [data-theme="light"] .now-playing::before {
+    background: radial-gradient(circle, rgba(45,138,0,0.04) 0%, transparent 70%);
+  }
+
+  .track-art {
+    width: 100%;
+    aspect-ratio: 1;
+    background: var(--surface2);
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+    overflow: hidden;
+    margin-bottom: 20px;
+  }
+
+  .vinyl {
+    width: 120px; height: 120px;
+    border-radius: 50%;
+    background: conic-gradient(
+      #1a1a1a 0deg, #2a2a2a 30deg, #1a1a1a 60deg,
+      #2a2a2a 90deg, #1a1a1a 120deg, #2a2a2a 150deg,
+      #1a1a1a 180deg, #2a2a2a 210deg, #1a1a1a 240deg,
+      #2a2a2a 270deg, #1a1a1a 300deg, #2a2a2a 330deg, #1a1a1a 360deg
+    );
+    box-shadow: 0 0 40px rgba(0,0,0,0.8), inset 0 0 30px rgba(0,0,0,0.5);
+    position: relative;
+    transition: transform 0.3s;
+  }
+
+  .vinyl.spinning { animation: spin 3s linear infinite; }
+  .vinyl.paused { animation: none; }
+
+  @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
+  .vinyl::after {
+    content: '';
+    position: absolute;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    width: 30px; height: 30px;
+    border-radius: 50%;
+    background: var(--bg);
+    border: 3px solid var(--accent);
+  }
+
+  .track-info { margin-bottom: 20px; }
+
+  .track-title {
+    font-family: 'DM Serif Display', serif;
+    font-size: 20px;
+    line-height: 1.2;
+    color: var(--text);
+    margin-bottom: 6px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .track-meta {
+    font-size: 11px;
+    color: var(--muted);
+    letter-spacing: 1px;
+  }
+
+  /* ── PROGRESS BAR ── */
+  .progress-wrap {
+    position: relative;
+    cursor: pointer;
+    padding: 8px 0;
+    margin-bottom: 8px;
+  }
+
+  .progress-track {
+    height: 3px;
+    background: var(--dim);
+    border-radius: 2px;
+    position: relative;
+    overflow: visible;
+  }
+
+  .progress-fill {
+    height: 100%;
+    background: var(--accent);
+    border-radius: 2px;
+    position: relative;
+    transition: width 0.5s linear;
+  }
+
+  .progress-fill::after {
+    content: '';
+    position: absolute;
+    right: -5px; top: 50%;
+    transform: translateY(-50%);
+    width: 10px; height: 10px;
+    background: var(--accent);
+    border-radius: 50%;
+    box-shadow: 0 0 8px var(--accent);
+    opacity: 0;
+    transition: opacity 0.2s;
+  }
+
+  .progress-wrap:hover .progress-fill::after { opacity: 1; }
+
+  .progress-times {
+    display: flex;
+    justify-content: space-between;
+    font-size: 10px;
+    color: var(--muted);
+    margin-top: 4px;
+  }
+
+  /* ── CONTROLS ── */
+  .controls {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    margin: 12px 0;
+    flex-wrap: wrap;
+  }
+
+  .ctrl-btn {
+    background: none;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    padding: 8px;
+    border-radius: 6px;
+    font-family: 'Space Mono', monospace;
+    font-size: 16px;
+    line-height: 1;
+    transition: color 0.15s, background 0.15s, transform 0.1s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .ctrl-btn:hover { color: var(--text); background: var(--surface2); }
+  .ctrl-btn:active { transform: scale(0.9); }
+  .ctrl-btn.primary {
+    color: var(--bg);
+    background: var(--accent);
+    width: 48px; height: 48px;
+    border-radius: 50%;
+    font-size: 18px;
+  }
+  .ctrl-btn.primary:hover { background: #d4ff6e; transform: scale(1.05); }
+  [data-theme="light"] .ctrl-btn.primary { color: #fff; }
+  [data-theme="light"] .ctrl-btn.primary:hover { background: #3a9e00; }
+
+  /* ── VOLUME ── */
+  .volume-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 11px;
+    color: var(--muted);
+  }
+
+  .vol-slider {
+    flex: 1;
+    -webkit-appearance: none;
+    height: 3px;
+    background: var(--dim);
+    border-radius: 2px;
+    outline: none;
+    cursor: pointer;
+  }
+
+  .vol-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 12px; height: 12px;
+    border-radius: 50%;
+    background: var(--accent);
+    cursor: pointer;
+    box-shadow: 0 0 6px var(--accent);
+  }
+
+  /* ── QUEUE ── */
+  .queue-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-height: 300px;
+    overflow-y: auto;
+  }
+
+  .queue-list::-webkit-scrollbar { width: 4px; }
+  .queue-list::-webkit-scrollbar-track { background: transparent; }
+  .queue-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+  .queue-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background 0.15s;
+    border: 1px solid transparent;
+    font-size: 12px;
+    position: relative;
+  }
+
+  .queue-item:hover { background: var(--surface2); border-color: var(--border); }
+
+  .queue-item.active {
+    background: var(--surface2);
+    border-color: rgba(200, 255, 90, 0.2);
+  }
+
+  [data-theme="light"] .queue-item.active {
+    border-color: rgba(45, 138, 0, 0.3);
+  }
+
+  .queue-num {
+    color: var(--muted);
+    font-size: 10px;
+    width: 20px;
+    text-align: right;
+    flex-shrink: 0;
+  }
+
+  .queue-item.active .queue-num { color: var(--accent); }
+
+  .queue-item-title {
+    flex: 1;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+  }
+
+  .queue-item.active .queue-item-title { color: var(--accent); }
+
+  .queue-item-remove {
+    opacity: 0;
+    background: none;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    padding: 4px;
+    border-radius: 4px;
+    font-size: 14px;
+    flex-shrink: 0;
+    transition: opacity 0.15s, color 0.15s;
+  }
+  .queue-item:hover .queue-item-remove { opacity: 1; }
+  .queue-item-remove:hover { color: var(--accent3); }
+
+  .queue-duration {
+    color: var(--muted);
+    font-size: 10px;
+    flex-shrink: 0;
+  }
+
+  .playing-bars {
+    display: flex;
+    align-items: flex-end;
+    gap: 2px;
+    height: 14px;
+    flex-shrink: 0;
+  }
+
+  .bar-line {
+    width: 3px;
+    background: var(--accent);
+    border-radius: 1px;
+    animation: barDance 0.8s ease-in-out infinite alternate;
+  }
+
+  .bar-line:nth-child(2) { animation-delay: 0.15s; }
+  .bar-line:nth-child(3) { animation-delay: 0.3s; }
+
+  @keyframes barDance {
+    from { height: 4px; }
+    to { height: 14px; }
+  }
+
+  /* ── LYRICS PANEL ── */
+  .lyrics-panel {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .lyrics-panel.hidden { display: none !important; }
+
+  .lyrics-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px 0;
+    position: relative;
+  }
+
+  .lyrics-content::-webkit-scrollbar { width: 3px; }
+  .lyrics-content::-webkit-scrollbar-thumb { background: var(--border); }
+
+  .lyric-line {
+    padding: 8px 0;
+    font-size: 14px;
+    line-height: 1.6;
+    color: var(--muted);
+    cursor: pointer;
+    transition: color 0.3s, transform 0.3s;
+    border-radius: 4px;
+  }
+
+  .lyric-line:hover { color: var(--text); }
+
+  .lyric-line.active {
+    color: var(--text);
+    font-size: 16px;
+    transform: translateX(4px);
+  }
+
+  .lyric-line.past { color: var(--dim); }
+
+  /* ── MINI STATS ── */
+  .stats-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+
+  .stat-cell {
+    background: var(--surface2);
+    border-radius: 8px;
+    padding: 12px;
+    border: 1px solid var(--border);
+  }
+
+  .stat-val {
+    font-size: 20px;
+    font-weight: 700;
+    color: var(--accent2);
+    margin-bottom: 2px;
+  }
+
+  .stat-lbl {
+    font-size: 10px;
+    color: var(--muted);
+    letter-spacing: 1px;
+    text-transform: uppercase;
+  }
+
+  /* ── COMMAND BAR ── */
+  .cmd-bar {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 16px;
+    flex-wrap: wrap;
+  }
+
+  .cmd-prefix { color: var(--accent); font-size: 13px; }
+
+  .cmd-input {
+    flex: 1;
+    min-width: 120px;
+    background: none;
+    border: none;
+    outline: none;
+    color: var(--text);
+    font-family: 'Space Mono', monospace;
+    font-size: 13px;
+  }
+
+  .cmd-input::placeholder { color: var(--dim); }
+
+  .cmd-hints {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .cmd-hint {
+    font-size: 10px;
+    color: var(--muted);
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 3px 7px;
+    cursor: pointer;
+    transition: all 0.15s;
+    letter-spacing: 0.5px;
+  }
+
+  .cmd-hint:hover { color: var(--accent); border-color: rgba(200,255,90,0.3); }
+
+  /* ── TAGS ── */
+  .tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 10px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    padding: 3px 8px;
+    border-radius: 20px;
+    border: 1px solid;
+  }
+
+  .tag-green { color: var(--accent); border-color: rgba(200,255,90,0.3); background: rgba(200,255,90,0.06); }
+  .tag-cyan  { color: var(--accent2); border-color: rgba(90,255,220,0.3); background: rgba(90,255,220,0.06); }
+  .tag-pink  { color: var(--accent3); border-color: rgba(255,90,140,0.3); background: rgba(255,90,140,0.06); }
+  [data-theme="light"] .tag-green { border-color: rgba(45,138,0,0.4); background: rgba(45,138,0,0.08); }
+  [data-theme="light"] .tag-cyan { border-color: rgba(0,138,110,0.4); background: rgba(0,138,110,0.08); }
+  [data-theme="light"] .tag-pink { border-color: rgba(196,30,58,0.4); background: rgba(196,30,58,0.08); }
+
+  /* ── SHORTCUT LEGEND OVERLAY ── */
+  .shortcut-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.7);
+    z-index: 500;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+  .shortcut-overlay.show { display: flex; }
+
+  [data-theme="light"] .shortcut-overlay {
+    background: rgba(0,0,0,0.5);
+  }
+
+  .shortcut-modal {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 28px;
+    max-width: 520px;
+    width: 100%;
+    max-height: 90vh;
+    overflow-y: auto;
+  }
+
+  .shortcut-modal h2 {
+    font-family: 'DM Serif Display', serif;
+    font-size: 22px;
+    color: var(--accent);
+    margin-bottom: 20px;
+  }
+
+  .shortcut-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px 24px;
+  }
+
+  .shortcut-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 8px 12px;
+    background: var(--surface2);
+    border-radius: 8px;
+    border: 1px solid var(--border);
+  }
+
+  .shortcut-key {
+    font-size: 11px;
+    padding: 4px 8px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--accent);
+    font-family: 'Space Mono', monospace;
+  }
+
+  .shortcut-desc {
+    font-size: 12px;
+    color: var(--text);
+  }
+
+  /* ── MODAL / TOAST ── */
+  .toast {
+    position: fixed;
+    bottom: 24px; left: 50%;
+    transform: translateX(-50%) translateY(80px);
+    background: var(--surface2);
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    font-size: 12px;
+    padding: 10px 20px;
+    border-radius: 6px;
+    letter-spacing: 1px;
+    transition: transform 0.3s cubic-bezier(0.34,1.56,0.64,1);
+    z-index: 200;
+    pointer-events: none;
+  }
+
+  .toast.show { transform: translateX(-50%) translateY(0); }
+
+  /* ── RESPONSIVE ── */
+  @media (max-width: 768px) {
+    .layout {
+      grid-template-columns: 1fr;
+      padding: 12px;
+      gap: 12px;
+    }
+    .header { grid-column: 1; }
+    .sidebar, .main { grid-row: auto; }
+    .logo { font-size: 22px; }
+    .logo span { font-size: 12px; margin-left: 8px; }
+    .controls { gap: 12px; }
+    .ctrl-btn.primary { width: 44px; height: 44px; }
+    .shortcut-grid { grid-template-columns: 1fr; }
+  }
+
+  @media (max-width: 480px) {
+    .layout { padding: 8px; }
+    .now-playing { padding: 16px; }
+    .cmd-bar { padding: 8px 12px; }
+    .cmd-hints { display: none; }
+  }
+
+  /* Scrolling track title */
+  .marquee-wrap { overflow: hidden; position: relative; }
+  .marquee-wrap::after {
+    content: '';
+    position: absolute;
+    right: 0; top: 0; bottom: 0;
+    width: 40px;
+    background: linear-gradient(to right, transparent, var(--surface));
+    pointer-events: none;
+  }
+
+  /* EQ preset buttons */
+  .eq-grid { display: flex; flex-wrap: wrap; gap: 6px; }
+  .eq-btn {
+    font-family: 'Space Mono', monospace;
+    font-size: 10px;
+    padding: 5px 10px;
+    border-radius: 20px;
+    border: 1px solid var(--border);
+    background: none;
+    color: var(--muted);
+    cursor: pointer;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    transition: all 0.15s;
+  }
+
+  .eq-btn:hover, .eq-btn.active { color: var(--accent2); border-color: rgba(90,255,220,0.4); background: rgba(90,255,220,0.06); }
+</style>
+</head>
+<body>
+
+<div class="layout">
+
+  <!-- HEADER -->
+  <header class="header">
+    <div class="logo">m<span>terminal music CLI v6 · <kbd style="background:var(--surface2);border:1px solid var(--border);border-radius:3px;padding:1px 5px;font-size:11px;color:var(--accent)">m uxi</kbd> to open</span></div>
+    <div class="header-right">
+      <span class="tag tag-green" id="autodj-badge" style="display:none">🤖 auto-dj</span>
+      <span class="tag tag-pink" id="repeat-badge" style="display:none">🔁 repeat</span>
+      <span class="tag tag-cyan" id="loop-one-badge" style="display:none">🔂 loop one</span>
+      <button class="theme-toggle" id="theme-toggle" title="Toggle dark/light mode" aria-label="Toggle theme">🌙</button>
+      <div class="status-badge">
+        <div class="status-dot" id="status-dot"></div>
+        <span id="daemon-status">connecting…</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- SIDEBAR: Now Playing -->
+  <aside class="sidebar">
+    <div class="now-playing">
+      <div class="card-label">now playing</div>
+
+      <div class="track-art">
+        <div class="vinyl paused" id="vinyl"></div>
+      </div>
+
+      <div class="track-info">
+        <div class="marquee-wrap">
+          <div class="track-title" id="track-title">nothing playing</div>
+        </div>
+        <div class="track-meta" id="track-meta">— connecting… —</div>
+      </div>
+
+      <!-- Progress -->
+      <div class="progress-wrap" id="progress-wrap" onclick="seekClick(event)">
+        <div class="progress-track">
+          <div class="progress-fill" id="progress-fill" style="width:0%"></div>
+        </div>
+        <div class="progress-times">
+          <span id="time-pos">0:00</span>
+          <span id="time-dur">0:00</span>
+        </div>
+      </div>
+
+      <!-- Controls -->
+      <div class="controls">
+        <button class="ctrl-btn" onclick="cmd('repeat')" id="btn-repeat" title="Toggle repeat (m repeat)">🔁</button>
+        <button class="ctrl-btn" onclick="cmd('prev')" title="Previous (m prev)">⏮</button>
+        <button class="ctrl-btn" onclick="cmd('seek -10')" title="Back 10s">⏪</button>
+        <button class="ctrl-btn primary" id="play-btn" onclick="cmd('pause')" title="Play/Pause (m pause)">▶</button>
+        <button class="ctrl-btn" onclick="cmd('seek +10')" title="Forward 10s">⏩</button>
+        <button class="ctrl-btn" onclick="cmd('next')" title="Next (m next)">⏭</button>
+        <button class="ctrl-btn" onclick="cmd('like')" title="Like track (m like)">♡</button>
+      </div>
+
+      <!-- Volume -->
+      <div class="volume-row">
+        <span>🔈</span>
+        <input type="range" class="vol-slider" id="vol-slider" min="0" max="150" value="80"
+               oninput="setVolume(this.value)">
+        <span id="vol-val">80%</span>
+        <span>🔊</span>
+      </div>
+    </div>
+
+    <!-- Stats -->
+    <div class="card">
+      <div class="card-label">session stats</div>
+      <div class="stats-grid">
+        <div class="stat-cell">
+          <div class="stat-val" id="stat-queue">0</div>
+          <div class="stat-lbl">in queue</div>
+        </div>
+        <div class="stat-cell">
+          <div class="stat-val" id="stat-speed" style="color:var(--accent3)">1.0x</div>
+          <div class="stat-lbl">speed</div>
+        </div>
+        <div class="stat-cell">
+          <div class="stat-val" id="stat-pos" style="color:var(--accent)">—</div>
+          <div class="stat-lbl">track pos</div>
+        </div>
+        <div class="stat-cell">
+          <div class="stat-val" id="stat-pct" style="color:var(--muted)">—</div>
+          <div class="stat-lbl">progress</div>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- MAIN CONTENT -->
+  <main class="main">
+    <!-- Queue -->
+    <div class="card" style="flex:1;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; flex-wrap:wrap; gap:8px;">
+        <div class="card-label" style="margin-bottom:0">queue</div>
+        <div style="display:flex;gap:8px;">
+          <button class="eq-btn" onclick="cmd('shuffle')">🔀 shuffle</button>
+          <button class="eq-btn" onclick="cmd('clear')">🗑 clear</button>
+        </div>
+      </div>
+      <div class="queue-list" id="queue-list">
+        <div style="color:var(--muted);font-size:12px;padding:20px 0;text-align:center;">
+          queue empty — type a song below to play
+        </div>
+      </div>
+    </div>
+
+    <!-- Lyrics -->
+    <div class="card lyrics-panel" id="lyrics-panel" style="min-height:200px;">
+      <div class="card-label">lyrics <span class="tag tag-cyan" style="margin-left:8px;">lrclib.net</span></div>
+      <div class="lyrics-content" id="lyrics-content">
+        <div class="lyric-line active">♪ no lyrics loaded</div>
+        <div class="lyric-line">run: m lyrics</div>
+      </div>
+    </div>
+
+    <!-- EQ -->
+    <div class="card">
+      <div class="card-label">equalizer</div>
+      <div class="eq-grid">
+        <button class="eq-btn active" id="eq-flat" onclick="setEq('flat')">flat</button>
+        <button class="eq-btn" id="eq-bass" onclick="setEq('bass')">bass</button>
+        <button class="eq-btn" id="eq-treble" onclick="setEq('treble')">treble</button>
+        <button class="eq-btn" id="eq-vocal" onclick="setEq('vocal')">vocal</button>
+        <button class="eq-btn" id="eq-loud" onclick="setEq('loud')">loudness</button>
+        <button class="eq-btn" id="eq-norm" onclick="cmd('norm')">⚖ normalize</button>
+      </div>
+    </div>
+  </main>
+
+  <!-- COMMAND BAR -->
+  <div class="cmd-bar">
+    <span class="cmd-prefix">m</span>
+    <input class="cmd-input" id="cmd-input" placeholder='search & play: "lofi beats"  or  pause · next · vol 80 · seek +10 · shuffle · repeat'
+           onkeydown="handleCmd(event)">
+    <div class="cmd-hints">
+      <span class="cmd-hint" onclick="quickPlay('lofi hip hop')">lofi</span>
+      <span class="cmd-hint" onclick="quickPlay('jazz classics')">jazz</span>
+      <span class="cmd-hint" onclick="quickPlay('synthwave')">synth</span>
+      <span class="cmd-hint" onclick="cmd('repeat')">🔁</span>
+      <span class="cmd-hint" onclick="cmd('shuffle')">🔀</span>
+      <span class="cmd-hint" onclick="document.getElementById('cmd-input').focus()">/ focus</span>
+    </div>
+  </div>
+
+</div>
+
+<!-- Shortcut Legend Overlay -->
+<div class="shortcut-overlay" id="shortcut-overlay" onclick="toggleShortcutOverlay(event)">
+  <div class="shortcut-modal" onclick="event.stopPropagation()">
+    <h2>⌨ Keyboard shortcuts</h2>
+    <div class="shortcut-grid">
+      <div class="shortcut-item"><span class="shortcut-key">Space</span><span class="shortcut-desc">Play / Pause</span></div>
+      <div class="shortcut-item"><span class="shortcut-key">n</span><span class="shortcut-desc">Next track</span></div>
+      <div class="shortcut-item"><span class="shortcut-key">b</span><span class="shortcut-desc">Previous track</span></div>
+      <div class="shortcut-item"><span class="shortcut-key">l</span><span class="shortcut-desc">Toggle lyrics panel</span></div>
+      <div class="shortcut-item"><span class="shortcut-key">+</span><span class="shortcut-desc">Volume up</span></div>
+      <div class="shortcut-item"><span class="shortcut-key">−</span><span class="shortcut-desc">Volume down</span></div>
+      <div class="shortcut-item"><span class="shortcut-key">,</span><span class="shortcut-desc">Seek −10s</span></div>
+      <div class="shortcut-item"><span class="shortcut-key">.</span><span class="shortcut-desc">Seek +10s</span></div>
+      <div class="shortcut-item"><span class="shortcut-key">←</span><span class="shortcut-desc">Seek −10s</span></div>
+      <div class="shortcut-item"><span class="shortcut-key">→</span><span class="shortcut-desc">Seek +10s</span></div>
+      <div class="shortcut-item"><span class="shortcut-key">↑</span><span class="shortcut-desc">Volume up</span></div>
+      <div class="shortcut-item"><span class="shortcut-key">↓</span><span class="shortcut-desc">Volume down</span></div>
+      <div class="shortcut-item"><span class="shortcut-key">s</span><span class="shortcut-desc">Shuffle</span></div>
+      <div class="shortcut-item"><span class="shortcut-key">r</span><span class="shortcut-desc">Repeat toggle</span></div>
+      <div class="shortcut-item"><span class="shortcut-key">/</span><span class="shortcut-desc">Focus command bar</span></div>
+      <div class="shortcut-item"><span class="shortcut-key">?</span><span class="shortcut-desc">Show / hide shortcuts</span></div>
+    </div>
+  </div>
+</div>
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────────
+const state = {
+  alive: false,
+  connecting: true,
+  playing: false,
+  paused: true,
+  title: 'nothing playing',
+  pos: 0,
+  dur: 0,
+  volume: 80,
+  speed: 1.0,
+  queue: [],
+  currentIdx: -1,
+  eq: 'flat',
+  lyrics: null,
+  repeat: false,
+  loopOne: false,
+  autoDj: false,
+  _prevTitle: '',
+};
+
+const API = (() => {
+  const loc = window.location;
+  if (loc.protocol === 'http:' || loc.protocol === 'https:') return loc.origin;
+  return 'http://127.0.0.1:7700';
+})();
+
+// ── XSS: Escape HTML ────────────────────────────────────────────────────────
+function escapeHtml(str) {
+  if (!str || typeof str !== 'string') return '';
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+// ── API helpers ────────────────────────────────────────────────────────────
+
+async function apiState() {
+  try {
+    const r = await fetch(API + '/api/state', {signal: AbortSignal.timeout(3000)});
+    return await r.json();
+  } catch { return null; }
+}
+
+async function apiCmd(cmdStr) {
+  try {
+    await fetch(API + '/api/cmd', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({cmd: cmdStr}),
+      signal: AbortSignal.timeout(3000),
+    });
+  } catch {}
+}
+
+async function apiPlay(query) {
+  try {
+    await fetch(API + '/api/play', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({query}),
+      signal: AbortSignal.timeout(3000),
+    });
+  } catch {}
+}
+
+// ── SSE + Polling ───────────────────────────────────────────────────────────
+
+let sse = null;
+let pollInterval = null;
+let lastQueueJSON = '';
+const POLL_INTERVAL = 500;
+const SSE_RECONNECT_DELAY = 3000;
+
+function connectSSE() {
+  if (sse) {
+    sse.close();
+    sse = null;
+  }
+  try {
+    sse = new EventSource(API + '/api/events');
+    sse.onopen = () => {
+      state.connecting = false;
+      if (pollInterval) {
+        clearInterval(pollInterval);
+        pollInterval = null;
+      }
+      poll(); // initial fetch
+    };
+    sse.onmessage = (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        Object.assign(state, data);
+        state.alive = true;
+        state.connecting = false;
+        updateNowPlaying();
+        const newQueueJSON = JSON.stringify(data.queue || state.queue) + '|' + (data.currentIdx ?? state.currentIdx) + '|' + (data.paused ?? state.paused);
+        if (newQueueJSON !== lastQueueJSON) {
+          lastQueueJSON = newQueueJSON;
+          updateQueue();
+        }
+        updateLyrics();
+      } catch (_) {}
+    };
+    sse.onerror = () => {
+      sse.close();
+      sse = null;
+      fallbackToPolling();
+    };
+  } catch (_) {
+    fallbackToPolling();
+  }
+}
+
+function fallbackToPolling() {
+  if (pollInterval) return;
+  pollInterval = setInterval(poll, POLL_INTERVAL);
+  poll();
+}
+
+async function poll() {
+  const data = await apiState();
+  if (!data) {
+    state.alive = false;
+    state.connecting = !sse;
+    updateNowPlaying();
+    return;
+  }
+  state.connecting = false;
+  state.alive = true;
+  Object.assign(state, data);
+  updateNowPlaying();
+  const newQueueJSON = JSON.stringify(data.queue) + '|' + data.currentIdx + '|' + data.paused;
+  if (newQueueJSON !== lastQueueJSON) {
+    lastQueueJSON = newQueueJSON;
+    updateQueue();
+  }
+  updateLyrics();
+}
+
+// Start: try SSE first, fallback to polling
+connectSSE();
+setTimeout(() => {
+  if (!sse || sse.readyState !== EventSource.OPEN) {
+    fallbackToPolling();
+  }
+}, 2000);
+
+// ── UI Update ──────────────────────────────────────────────────────────────
+
+function updateNowPlaying() {
+  const {title, pos, dur, paused, volume, speed, queue, currentIdx, alive, connecting} = state;
+
+  document.getElementById('track-title').textContent = escapeHtml(title || 'nothing playing');
+  const metaEl = document.getElementById('track-meta');
+  if (connecting && !alive) {
+    metaEl.textContent = '— connecting… —';
+  } else if (!alive) {
+    metaEl.textContent = '— daemon offline —';
+  } else if (paused) {
+    metaEl.textContent = (title && title !== 'nothing playing') ? '⏸ paused' : '— idle —';
+  } else {
+    metaEl.textContent = '▶ playing';
+  }
+
+  const pct = dur > 0 ? (pos / dur * 100) : 0;
+  document.getElementById('progress-fill').style.width = pct + '%';
+  document.getElementById('time-pos').textContent = fmtTime(pos);
+  document.getElementById('time-dur').textContent = fmtTime(dur);
+  document.getElementById('play-btn').textContent = paused ? '▶' : '⏸';
+
+  const vinyl = document.getElementById('vinyl');
+  if (!paused && title && title !== 'nothing playing') {
+    vinyl.classList.add('spinning');
+    vinyl.classList.remove('paused');
+  } else {
+    vinyl.classList.remove('spinning');
+    vinyl.classList.add('paused');
+  }
+
+  document.getElementById('vol-slider').value = volume;
+  document.getElementById('vol-val').textContent = Math.round(volume) + '%';
+
+  document.getElementById('stat-queue').textContent = queue.length;
+  document.getElementById('stat-speed').textContent = speed.toFixed(1) + 'x';
+  document.getElementById('stat-pos').textContent = fmtTime(pos);
+  document.getElementById('stat-pct').textContent = dur > 0 ? Math.round(pct) + '%' : '—';
+
+  const dot = document.getElementById('status-dot');
+  const statusLabel = document.getElementById('daemon-status');
+  dot.classList.remove('connecting', 'offline');
+  if (connecting && !alive) {
+    dot.classList.add('connecting');
+    statusLabel.textContent = 'connecting…';
+  } else if (!alive) {
+    dot.classList.add('offline');
+    statusLabel.textContent = 'offline';
+  } else if (title && title !== 'nothing playing') {
+    dot.style.background = paused ? 'var(--accent3)' : 'var(--accent)';
+    dot.style.animation = paused ? 'none' : 'pulse 2s ease-in-out infinite';
+    statusLabel.textContent = paused ? 'paused' : 'playing';
+  } else {
+    dot.style.background = 'var(--muted)';
+    dot.style.animation = 'none';
+    statusLabel.textContent = 'idle';
+  }
+
+  document.getElementById('repeat-badge').style.display = state.repeat ? '' : 'none';
+  document.getElementById('autodj-badge').style.display = state.autoDj ? '' : 'none';
+  document.getElementById('loop-one-badge').style.display = state.loopOne ? '' : 'none';
+}
+
+function updateQueue() {
+  const {queue, currentIdx, paused} = state;
+  const el = document.getElementById('queue-list');
+  if (!queue.length) {
+    el.innerHTML = '<div style="color:var(--muted);font-size:12px;padding:20px 0;text-align:center;">queue empty — type a song below to play</div>';
+    return;
+  }
+  el.innerHTML = queue.map((item, i) => {
+    const title = escapeHtml(item.title || 'Unknown');
+    const active = i === currentIdx;
+    const bars = active ? `
+      <div class="playing-bars">
+        <div class="bar-line" style="${paused ? 'height:4px;animation:none;' : ''}"></div>
+        <div class="bar-line" style="${paused ? 'height:8px;animation:none;' : ''}"></div>
+        <div class="bar-line" style="${paused ? 'height:6px;animation:none;' : ''}"></div>
+      </div>
+    ` : `<span class="queue-num">${i + 1}</span>`;
+    return `
+    <div class="queue-item ${active ? 'active' : ''}" onclick="playQueueItem(${i})">
+      ${bars}
+      <span class="queue-item-title">${title}</span>
+      <button class="queue-item-remove" onclick="event.stopPropagation();removeQueueItem(${i})" title="Remove from queue">✕</button>
+    </div>`;
+  }).join('');
+
+  const active = el.querySelector('.active');
+  if (active) active.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+
+function updateLyrics() {
+  const el = document.getElementById('lyrics-content');
+  const {lyrics, pos} = state;
+
+  if (!lyrics || typeof lyrics === 'string' || !lyrics.lines || !lyrics.lines.length) {
+    if (!state.title || state.title === 'nothing playing') {
+      el.innerHTML = '<div class="lyric-line active">♪ no lyrics loaded</div><div class="lyric-line">play a song to see lyrics</div>';
+    } else if (lyrics === 'loading') {
+      el.innerHTML = '<div class="lyric-line active">♪ fetching lyrics…</div>';
+    } else if (lyrics === 'not_found') {
+      el.innerHTML = '<div class="lyric-line active">♪ no lyrics found</div><div class="lyric-line">try: m lyrics</div>';
+    } else {
+      el.innerHTML = '<div class="lyric-line active">♪ fetching lyrics…</div>';
+    }
+    return;
+  }
+
+  const lines = lyrics.lines;
+  let cur = 0;
+  if (lyrics.synced) {
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].t <= pos) cur = i;
+    }
+  }
+
+  el.innerHTML = lines.map((line, i) => {
+    const cls = lyrics.synced
+      ? (i === cur ? 'active' : (i < cur ? 'past' : ''))
+      : '';
+    const onclick = lyrics.synced ? `onclick="seekToLyric(${line.t})"` : '';
+    const text = escapeHtml(line.text || '♪');
+    return `<div class="lyric-line ${cls}" ${onclick}>${text}</div>`;
+  }).join('');
+
+  if (lyrics.synced) {
+    const activeLine = el.querySelector('.active');
+    if (activeLine) activeLine.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }
+}
+
+// ── Commands ───────────────────────────────────────────────────────────────
+
+function cmd(command) {
+  apiCmd(command);
+  showToast('→ ' + command);
+}
+
+function setVolume(val) {
+  const v = Math.max(0, Math.min(150, parseInt(val)));
+  apiCmd('vol ' + v);
+}
+
+function setEq(preset) {
+  state.eq = preset;
+  document.querySelectorAll('.eq-btn').forEach(b => b.classList.remove('active'));
+  const btn = document.getElementById('eq-' + preset);
+  if (btn) btn.classList.add('active');
+  apiCmd('eq ' + preset);
+  showToast('🎚 eq: ' + preset);
+}
+
+function quickPlay(query) {
+  apiPlay(query);
+  showToast('🎵 playing: ' + query);
+}
+
+function playQueueItem(idx) {
+  apiCmd('playlist-play-index ' + idx);
+  showToast('▶ track ' + (idx + 1));
+}
+
+function removeQueueItem(idx) {
+  apiCmd('qrm ' + (idx + 1));  // qrm uses 1-based position
+  showToast('removed from queue');
+}
+
+function seekClick(event) {
+  if (!state.dur || state.dur <= 0) return;
+  const rect = event.currentTarget.getBoundingClientRect();
+  const x = event.clientX - rect.left;
+  const pct = x / rect.width;
+  const target = Math.round(pct * state.dur);
+  apiCmd('seek ' + target);
+  showToast('⏩ ' + fmtTime(target));
+}
+
+function seekToLyric(t) {
+  apiCmd('seek ' + t);
+  showToast('⏩ ' + fmtTime(t));
+}
+
+// ── Dark/Light theme ───────────────────────────────────────────────────────
+
+function initTheme() {
+  const saved = localStorage.getItem('m-ui-theme') || 'dark';
+  document.documentElement.setAttribute('data-theme', saved);
+  const btn = document.getElementById('theme-toggle');
+  btn.textContent = saved === 'dark' ? '🌙' : '☀';
+}
+
+function toggleTheme() {
+  const current = document.documentElement.getAttribute('data-theme') || 'dark';
+  const next = current === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('m-ui-theme', next);
+  document.getElementById('theme-toggle').textContent = next === 'dark' ? '🌙' : '☀';
+}
+
+// ── Shortcut overlay ────────────────────────────────────────────────────────
+
+function toggleShortcutOverlay(e) {
+  if (e && e.target !== e.currentTarget) return;
+  const el = document.getElementById('shortcut-overlay');
+  el.classList.toggle('show');
+}
+
+// ── Lyrics panel toggle ──────────────────────────────────────────────────────
+
+function toggleLyricsPanel() {
+  const el = document.getElementById('lyrics-panel');
+  el.classList.toggle('hidden');
+  localStorage.setItem('m-ui-lyrics-visible', !el.classList.contains('hidden'));
+}
+
+// ── Command history ────────────────────────────────────────────────────────
+const cmdHistory = [];
+let cmdHistoryIdx = 0;
+
+const knownCmds = new Set([
+  'pause','pp','next','mn','prev','mb','stop','start','shuffle','repeat','rp','clear','now','bar','lyrics','art','status','like','unlike','history',
+  'queue','norm','update','doctor','vol','volume','seek','speed','autodj','repeat-one','ro','likes','love','similar','replay','rl',
+  'sleep','export','reload-config','index','local','cast','bookmark','bookmarks','bookmark-load','bl','eq','dl','dl-list','import','txt','txts',
+  'txtnext','tn','txtprev','tp','txtnow','txtpick','tj','txtedit','te','txt-export','save','load','playlists','pls','pldel','hp','sp','devices',
+  'queue-restore','qr','qmove','qrm','log','log-clear','cache-clear','cache-prune','cache-stats','scrub','slider','add-next','help',
+  'pin','pins','radio','stats','search','chapter','queue-dedup','crossfade','queue-fzf','config-edit','notify','completions','queue-save-auto','history-stats'
+]);
+
+function handleCmd(e) {
+  if (e.key === 'Enter') {
+    const val = e.target.value.trim();
+    if (!val) return;
+    cmdHistory.push(val);
+    cmdHistoryIdx = cmdHistory.length;
+    e.target.value = '';
+
+    const first = val.split(/\s+/)[0];
+
+    if (first === 'eq') {
+      const preset = val.split(/\s+/)[1];
+      if (preset) setEq(preset);
+      else showToast('eq presets: flat bass treble vocal loud');
+    } else if (knownCmds.has(first)) {
+      cmd(val);
+    } else {
+      apiPlay(val);
+      showToast('🎵 searching: ' + val);
+    }
+  }
+  if (e.key === 'ArrowUp') {
+    if (cmdHistoryIdx > 0) {
+      cmdHistoryIdx--;
+      e.target.value = cmdHistory[cmdHistoryIdx] || '';
+    }
+    e.preventDefault();
+  }
+  if (e.key === 'ArrowDown') {
+    if (cmdHistoryIdx < cmdHistory.length - 1) {
+      cmdHistoryIdx++;
+      e.target.value = cmdHistory[cmdHistoryIdx] || '';
+    } else {
+      cmdHistoryIdx = cmdHistory.length;
+      e.target.value = '';
+    }
+    e.preventDefault();
+  }
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+function fmtTime(s) {
+  s = Math.floor(s || 0);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+let toastTimer;
+function showToast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 2000);
+}
+
+// ── Keyboard shortcuts ─────────────────────────────────────────────────────
+document.addEventListener('keydown', (e) => {
+  const isInput = e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.isContentEditable;
+  if (isInput && e.key !== 'Escape' && e.key !== '?') return;
+
+  switch (e.key) {
+    case ' ': e.preventDefault(); cmd('pause'); break;
+    case 'n': if (!isInput) { e.preventDefault(); cmd('next'); } break;
+    case 'b': if (!isInput) { e.preventDefault(); cmd('prev'); } break;
+    case 'l': if (!isInput) { e.preventDefault(); toggleLyricsPanel(); } break;
+    case '+': case '=': if (!isInput) { e.preventDefault(); cmd('vol +5'); } break;
+    case '-': if (!isInput) { e.preventDefault(); cmd('vol -5'); } break;
+    case ',': if (!isInput) { e.preventDefault(); cmd('seek -10'); } break;
+    case '.': if (!isInput) { e.preventDefault(); cmd('seek +10'); } break;
+    case 'ArrowRight': if (!isInput) cmd('seek +10'); break;
+    case 'ArrowLeft':  if (!isInput) cmd('seek -10'); break;
+    case 'ArrowUp':    if (!isInput) cmd('vol +5'); break;
+    case 'ArrowDown':  if (!isInput) cmd('vol -5'); break;
+    case 's': if (!isInput) { e.preventDefault(); cmd('shuffle'); } break;
+    case 'r': if (!isInput) { e.preventDefault(); cmd('repeat'); } break;
+    case '/': e.preventDefault(); document.getElementById('cmd-input').focus(); break;
+    case '?': e.preventDefault(); toggleShortcutOverlay(); break;
+    case 'Escape':
+      document.getElementById('cmd-input').blur();
+      document.getElementById('shortcut-overlay').classList.remove('show');
+      break;
+  }
+});
+
+// ── Init ───────────────────────────────────────────────────────────────────
+initTheme();
+document.getElementById('theme-toggle').onclick = toggleTheme;
+
+const lyricsVisible = localStorage.getItem('m-ui-lyrics-visible');
+if (lyricsVisible === 'false') {
+  document.getElementById('lyrics-panel').classList.add('hidden');
+}
+
+showToast('connecting to m daemon… · press ? for shortcuts');
+</script>
+</body>
+</html>

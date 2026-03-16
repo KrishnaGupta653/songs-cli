@@ -1,0 +1,1227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>m — music</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=DM+Serif+Display:ital@0;1&display=swap');
+
+  :root {
+    --bg: #0a0a0b;
+    --surface: #111114;
+    --surface2: #18181d;
+    --border: #2a2a35;
+    --accent: #c8ff5a;
+    --accent2: #5affdc;
+    --accent3: #ff5a8c;
+    --text: #e8e8f0;
+    --muted: #555566;
+    --dim: #333340;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Space Mono', monospace;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* Grain overlay */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.04'/%3E%3C/svg%3E");
+    pointer-events: none;
+    z-index: 100;
+    opacity: 0.4;
+  }
+
+  .layout {
+    display: grid;
+    grid-template-columns: 320px 1fr;
+    grid-template-rows: auto 1fr auto;
+    min-height: 100vh;
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 24px;
+    gap: 16px;
+  }
+
+  /* ── HEADER ── */
+  .header {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .logo {
+    font-family: 'DM Serif Display', serif;
+    font-size: 28px;
+    letter-spacing: -1px;
+    color: var(--accent);
+  }
+
+  .logo span { color: var(--muted); font-size: 14px; font-family: 'Space Mono', monospace; margin-left: 12px; }
+
+  .status-badge {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 11px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 2px;
+  }
+
+  .status-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--accent);
+    animation: pulse 2s ease-in-out infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(200,255,90,0.4); }
+    50% { opacity: 0.7; box-shadow: 0 0 0 6px rgba(200,255,90,0); }
+  }
+
+  /* ── SIDEBAR ── */
+  .sidebar {
+    grid-row: 2;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  /* ── MAIN ── */
+  .main {
+    grid-row: 2;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  /* ── CARD ── */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .card-label {
+    font-size: 10px;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 16px;
+  }
+
+  /* ── NOW PLAYING ── */
+  .now-playing {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .now-playing::before {
+    content: '';
+    position: absolute;
+    top: -40px; right: -40px;
+    width: 200px; height: 200px;
+    background: radial-gradient(circle, rgba(200,255,90,0.06) 0%, transparent 70%);
+    pointer-events: none;
+  }
+
+  .track-art {
+    width: 100%;
+    aspect-ratio: 1;
+    background: var(--surface2);
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+    overflow: hidden;
+    margin-bottom: 20px;
+  }
+
+  .vinyl {
+    width: 120px; height: 120px;
+    border-radius: 50%;
+    background: conic-gradient(
+      #1a1a1a 0deg, #2a2a2a 30deg, #1a1a1a 60deg,
+      #2a2a2a 90deg, #1a1a1a 120deg, #2a2a2a 150deg,
+      #1a1a1a 180deg, #2a2a2a 210deg, #1a1a1a 240deg,
+      #2a2a2a 270deg, #1a1a1a 300deg, #2a2a2a 330deg, #1a1a1a 360deg
+    );
+    box-shadow: 0 0 40px rgba(0,0,0,0.8), inset 0 0 30px rgba(0,0,0,0.5);
+    position: relative;
+    transition: transform 0.3s;
+  }
+
+  .vinyl.spinning { animation: spin 3s linear infinite; }
+  .vinyl.paused { animation: none; }
+
+  @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
+  .vinyl::after {
+    content: '';
+    position: absolute;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    width: 30px; height: 30px;
+    border-radius: 50%;
+    background: var(--bg);
+    border: 3px solid var(--accent);
+  }
+
+  .track-info { margin-bottom: 20px; }
+
+  .track-title {
+    font-family: 'DM Serif Display', serif;
+    font-size: 20px;
+    line-height: 1.2;
+    color: var(--text);
+    margin-bottom: 6px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .track-meta {
+    font-size: 11px;
+    color: var(--muted);
+    letter-spacing: 1px;
+  }
+
+  /* ── PROGRESS BAR ── */
+  .progress-wrap {
+    position: relative;
+    cursor: pointer;
+    padding: 8px 0;
+    margin-bottom: 8px;
+  }
+
+  .progress-track {
+    height: 3px;
+    background: var(--dim);
+    border-radius: 2px;
+    position: relative;
+    overflow: visible;
+  }
+
+  .progress-fill {
+    height: 100%;
+    background: var(--accent);
+    border-radius: 2px;
+    position: relative;
+    transition: width 0.5s linear;
+  }
+
+  .progress-fill::after {
+    content: '';
+    position: absolute;
+    right: -5px; top: 50%;
+    transform: translateY(-50%);
+    width: 10px; height: 10px;
+    background: var(--accent);
+    border-radius: 50%;
+    box-shadow: 0 0 8px var(--accent);
+    opacity: 0;
+    transition: opacity 0.2s;
+  }
+
+  .progress-wrap:hover .progress-fill::after { opacity: 1; }
+
+  .progress-times {
+    display: flex;
+    justify-content: space-between;
+    font-size: 10px;
+    color: var(--muted);
+    margin-top: 4px;
+  }
+
+  /* ── CONTROLS ── */
+  .controls {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    margin: 12px 0;
+  }
+
+  .ctrl-btn {
+    background: none;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    padding: 8px;
+    border-radius: 6px;
+    font-family: 'Space Mono', monospace;
+    font-size: 16px;
+    line-height: 1;
+    transition: color 0.15s, background 0.15s, transform 0.1s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .ctrl-btn:hover { color: var(--text); background: var(--surface2); }
+  .ctrl-btn:active { transform: scale(0.9); }
+  .ctrl-btn.primary {
+    color: var(--bg);
+    background: var(--accent);
+    width: 48px; height: 48px;
+    border-radius: 50%;
+    font-size: 18px;
+  }
+  .ctrl-btn.primary:hover { background: #d4ff6e; transform: scale(1.05); }
+
+  /* ── VOLUME ── */
+  .volume-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 11px;
+    color: var(--muted);
+  }
+
+  .vol-slider {
+    flex: 1;
+    -webkit-appearance: none;
+    height: 3px;
+    background: var(--dim);
+    border-radius: 2px;
+    outline: none;
+    cursor: pointer;
+  }
+
+  .vol-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 12px; height: 12px;
+    border-radius: 50%;
+    background: var(--accent);
+    cursor: pointer;
+    box-shadow: 0 0 6px var(--accent);
+  }
+
+  /* ── QUEUE ── */
+  .queue-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-height: 300px;
+    overflow-y: auto;
+  }
+
+  .queue-list::-webkit-scrollbar { width: 4px; }
+  .queue-list::-webkit-scrollbar-track { background: transparent; }
+  .queue-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+  .queue-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background 0.15s;
+    border: 1px solid transparent;
+    font-size: 12px;
+    position: relative;
+  }
+
+  .queue-item:hover { background: var(--surface2); border-color: var(--border); }
+
+  .queue-item.active {
+    background: var(--surface2);
+    border-color: rgba(200, 255, 90, 0.2);
+  }
+
+  .queue-num {
+    color: var(--muted);
+    font-size: 10px;
+    width: 20px;
+    text-align: right;
+    flex-shrink: 0;
+  }
+
+  .queue-item.active .queue-num { color: var(--accent); }
+
+  .queue-item-title {
+    flex: 1;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .queue-item.active .queue-item-title { color: var(--accent); }
+
+  .queue-duration {
+    color: var(--muted);
+    font-size: 10px;
+    flex-shrink: 0;
+  }
+
+  .playing-bars {
+    display: flex;
+    align-items: flex-end;
+    gap: 2px;
+    height: 14px;
+    flex-shrink: 0;
+  }
+
+  .bar-line {
+    width: 3px;
+    background: var(--accent);
+    border-radius: 1px;
+    animation: barDance 0.8s ease-in-out infinite alternate;
+  }
+
+  .bar-line:nth-child(2) { animation-delay: 0.15s; }
+  .bar-line:nth-child(3) { animation-delay: 0.3s; }
+
+  @keyframes barDance {
+    from { height: 4px; }
+    to { height: 14px; }
+  }
+
+  /* ── LYRICS PANEL ── */
+  .lyrics-panel {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .lyrics-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px 0;
+    position: relative;
+  }
+
+  .lyrics-content::-webkit-scrollbar { width: 3px; }
+  .lyrics-content::-webkit-scrollbar-thumb { background: var(--border); }
+
+  .lyric-line {
+    padding: 8px 0;
+    font-size: 14px;
+    line-height: 1.6;
+    color: var(--muted);
+    cursor: pointer;
+    transition: color 0.3s, transform 0.3s;
+    border-radius: 4px;
+  }
+
+  .lyric-line:hover { color: var(--text); }
+
+  .lyric-line.active {
+    color: var(--text);
+    font-size: 16px;
+    transform: translateX(4px);
+  }
+
+  .lyric-line.past { color: var(--dim); }
+
+  /* ── MINI STATS ── */
+  .stats-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+
+  .stat-cell {
+    background: var(--surface2);
+    border-radius: 8px;
+    padding: 12px;
+    border: 1px solid var(--border);
+  }
+
+  .stat-val {
+    font-size: 20px;
+    font-weight: 700;
+    color: var(--accent2);
+    margin-bottom: 2px;
+  }
+
+  .stat-lbl {
+    font-size: 10px;
+    color: var(--muted);
+    letter-spacing: 1px;
+    text-transform: uppercase;
+  }
+
+  /* ── COMMAND BAR ── */
+  .cmd-bar {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 16px;
+  }
+
+  .cmd-prefix { color: var(--accent); font-size: 13px; }
+
+  .cmd-input {
+    flex: 1;
+    background: none;
+    border: none;
+    outline: none;
+    color: var(--text);
+    font-family: 'Space Mono', monospace;
+    font-size: 13px;
+  }
+
+  .cmd-input::placeholder { color: var(--dim); }
+
+  .cmd-hints {
+    display: flex;
+    gap: 8px;
+  }
+
+  .cmd-hint {
+    font-size: 10px;
+    color: var(--muted);
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 3px 7px;
+    cursor: pointer;
+    transition: all 0.15s;
+    letter-spacing: 0.5px;
+  }
+
+  .cmd-hint:hover { color: var(--accent); border-color: rgba(200,255,90,0.3); }
+
+  /* ── TAGS ── */
+  .tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 10px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    padding: 3px 8px;
+    border-radius: 20px;
+    border: 1px solid;
+  }
+
+  .tag-green { color: var(--accent); border-color: rgba(200,255,90,0.3); background: rgba(200,255,90,0.06); }
+  .tag-cyan  { color: var(--accent2); border-color: rgba(90,255,220,0.3); background: rgba(90,255,220,0.06); }
+  .tag-pink  { color: var(--accent3); border-color: rgba(255,90,140,0.3); background: rgba(255,90,140,0.06); }
+
+  /* ── MODAL / TOAST ── */
+  .toast {
+    position: fixed;
+    bottom: 24px; left: 50%;
+    transform: translateX(-50%) translateY(80px);
+    background: var(--surface2);
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    font-size: 12px;
+    padding: 10px 20px;
+    border-radius: 6px;
+    letter-spacing: 1px;
+    transition: transform 0.3s cubic-bezier(0.34,1.56,0.64,1);
+    z-index: 200;
+    pointer-events: none;
+  }
+
+  .toast.show { transform: translateX(-50%) translateY(0); }
+
+  /* ── RESPONSIVE ── */
+  @media (max-width: 768px) {
+    .layout { grid-template-columns: 1fr; padding: 12px; }
+    .header { grid-column: 1; }
+    .sidebar, .main { grid-row: auto; }
+  }
+
+  /* Scrolling track title */
+  .marquee-wrap { overflow: hidden; position: relative; }
+  .marquee-wrap::after {
+    content: '';
+    position: absolute;
+    right: 0; top: 0; bottom: 0;
+    width: 40px;
+    background: linear-gradient(to right, transparent, var(--surface));
+    pointer-events: none;
+  }
+
+  /* EQ preset buttons */
+  .eq-grid { display: flex; flex-wrap: wrap; gap: 6px; }
+  .eq-btn {
+    font-family: 'Space Mono', monospace;
+    font-size: 10px;
+    padding: 5px 10px;
+    border-radius: 20px;
+    border: 1px solid var(--border);
+    background: none;
+    color: var(--muted);
+    cursor: pointer;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    transition: all 0.15s;
+  }
+
+  .eq-btn:hover, .eq-btn.active { color: var(--accent2); border-color: rgba(90,255,220,0.4); background: rgba(90,255,220,0.06); }
+</style>
+</head>
+<body>
+
+<div class="layout">
+
+  <!-- HEADER -->
+  <header class="header">
+    <div class="logo">m<span>terminal music CLI v5 · <kbd style="background:var(--surface2);border:1px solid var(--border);border-radius:3px;padding:1px 5px;font-size:11px;color:var(--accent)">m uxi</kbd> to open</span></div>
+    <div style="display:flex; gap:12px; align-items:center;">
+      <span class="tag tag-green" id="autodj-badge" style="display:none">🤖 auto-dj</span>
+      <span class="tag tag-pink" id="repeat-badge" style="display:none">🔁 repeat</span>
+      <div class="status-badge">
+        <div class="status-dot" id="status-dot" style="background:var(--muted);animation:none;"></div>
+        <span id="daemon-status">idle</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- SIDEBAR: Now Playing -->
+  <aside class="sidebar">
+    <div class="now-playing">
+      <div class="card-label">now playing</div>
+
+      <div class="track-art">
+        <div class="vinyl" id="vinyl"></div>
+      </div>
+
+      <div class="track-info">
+        <div class="marquee-wrap">
+          <div class="track-title" id="track-title">nothing playing</div>
+        </div>
+        <div class="track-meta" id="track-meta">— idle —</div>
+      </div>
+
+      <!-- Progress -->
+      <div class="progress-wrap" id="progress-wrap" onclick="seekClick(event)">
+        <div class="progress-track">
+          <div class="progress-fill" id="progress-fill" style="width:0%"></div>
+        </div>
+        <div class="progress-times">
+          <span id="time-pos">0:00</span>
+          <span id="time-dur">0:00</span>
+        </div>
+      </div>
+
+      <!-- Controls -->
+      <div class="controls">
+        <button class="ctrl-btn" onclick="cmd('repeat')" id="btn-repeat" title="Toggle repeat (m repeat)">🔁</button>
+        <button class="ctrl-btn" onclick="cmd('prev')" title="Previous (m prev)">⏮</button>
+        <button class="ctrl-btn" onclick="cmd('seek -10')" title="Back 10s">⏪</button>
+        <button class="ctrl-btn primary" id="play-btn" onclick="cmd('pause')" title="Play/Pause (m pause)">▶</button>
+        <button class="ctrl-btn" onclick="cmd('seek +10')" title="Forward 10s">⏩</button>
+        <button class="ctrl-btn" onclick="cmd('next')" title="Next (m next)">⏭</button>
+        <button class="ctrl-btn" onclick="cmd('like')" title="Like track (m like)">♡</button>
+      </div>
+
+      <!-- Volume -->
+      <div class="volume-row">
+        <span>🔈</span>
+        <input type="range" class="vol-slider" id="vol-slider" min="0" max="150" value="80"
+               oninput="setVolume(this.value)">
+        <span id="vol-val">80%</span>
+        <span>🔊</span>
+      </div>
+    </div>
+
+    <!-- Stats -->
+    <div class="card">
+      <div class="card-label">session stats</div>
+      <div class="stats-grid">
+        <div class="stat-cell">
+          <div class="stat-val" id="stat-queue">0</div>
+          <div class="stat-lbl">in queue</div>
+        </div>
+        <div class="stat-cell">
+          <div class="stat-val" id="stat-speed" style="color:var(--accent3)">1.0x</div>
+          <div class="stat-lbl">speed</div>
+        </div>
+        <div class="stat-cell">
+          <div class="stat-val" id="stat-pos" style="color:var(--accent)">—</div>
+          <div class="stat-lbl">track pos</div>
+        </div>
+        <div class="stat-cell">
+          <div class="stat-val" id="stat-pct" style="color:var(--muted)">—</div>
+          <div class="stat-lbl">progress</div>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- MAIN CONTENT -->
+  <main class="main">
+    <!-- Queue -->
+    <div class="card" style="flex:1;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+        <div class="card-label" style="margin-bottom:0">queue</div>
+        <div style="display:flex;gap:8px;">
+          <button class="eq-btn" onclick="cmd('shuffle')">🔀 shuffle</button>
+          <button class="eq-btn" onclick="cmd('clear')">🗑 clear</button>
+        </div>
+      </div>
+      <div class="queue-list" id="queue-list">
+        <div style="color:var(--muted);font-size:12px;padding:20px 0;text-align:center;">
+          queue empty — type a song below to play
+        </div>
+      </div>
+    </div>
+
+    <!-- Lyrics -->
+    <div class="card lyrics-panel" style="min-height:200px;">
+      <div class="card-label">lyrics <span class="tag tag-cyan" style="margin-left:8px;">lrclib.net</span></div>
+      <div class="lyrics-content" id="lyrics-content">
+        <div class="lyric-line active">♪ no lyrics loaded</div>
+        <div class="lyric-line">run: m lyrics</div>
+      </div>
+    </div>
+
+    <!-- EQ -->
+    <div class="card">
+      <div class="card-label">equalizer</div>
+      <div class="eq-grid">
+        <button class="eq-btn active" id="eq-flat" onclick="setEq('flat')">flat</button>
+        <button class="eq-btn" id="eq-bass" onclick="setEq('bass')">bass</button>
+        <button class="eq-btn" id="eq-treble" onclick="setEq('treble')">treble</button>
+        <button class="eq-btn" id="eq-vocal" onclick="setEq('vocal')">vocal</button>
+        <button class="eq-btn" id="eq-loud" onclick="setEq('loud')">loudness</button>
+        <button class="eq-btn" id="eq-norm" onclick="cmd('norm')">⚖ normalize</button>
+      </div>
+    </div>
+  </main>
+
+  <!-- COMMAND BAR -->
+  <div class="cmd-bar">
+    <span class="cmd-prefix">m</span>
+    <input class="cmd-input" id="cmd-input" placeholder='search & play: "lofi beats"  or  pause · next · vol 80 · seek +10 · shuffle · repeat'
+           onkeydown="handleCmd(event)">
+    <div class="cmd-hints">
+      <span class="cmd-hint" onclick="quickPlay('lofi hip hop')">lofi</span>
+      <span class="cmd-hint" onclick="quickPlay('jazz classics')">jazz</span>
+      <span class="cmd-hint" onclick="quickPlay('synthwave')">synth</span>
+      <span class="cmd-hint" onclick="cmd('repeat')">🔁</span>
+      <span class="cmd-hint" onclick="cmd('shuffle')">🔀</span>
+      <span class="cmd-hint" onclick="document.getElementById('cmd-input').focus()">/ focus</span>
+    </div>
+  </div>
+
+</div>
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────────
+const state = {
+  playing: false,
+  paused: false,
+  title: 'nothing playing',
+  pos: 0,
+  dur: 0,
+  volume: 80,
+  speed: 1.0,
+  queue: [],
+  currentIdx: 0,
+  eq: 'flat',
+  lyrics: [],
+  currentLyric: 0,
+  repeat: false,
+  autoDj: false,
+};
+
+// Demo queue data (simulating what `m queue` would return)
+const DEMO_QUEUE = [
+  { title: 'Boards of Canada — Roygbiv', dur: '2:31' },
+  { title: 'Aphex Twin — Xtal', dur: '4:55' },
+  { title: 'Burial — Archangel', dur: '6:02' },
+  { title: 'Four Tet — She Just Likes to Fight', dur: '7:40' },
+  { title: 'Jon Hopkins — Open Eye Signal', dur: '9:00' },
+];
+
+const DEMO_LYRICS = [
+  { t: 0,   text: '♪' },
+  { t: 5,   text: 'floating above the noise' },
+  { t: 10,  text: 'headphones on, eyes closed' },
+  { t: 15,  text: 'the city hums below' },
+  { t: 20,  text: 'frequencies align' },
+  { t: 25,  text: 'bass notes like breathing' },
+  { t: 30,  text: 'every sample a memory' },
+  { t: 35,  text: 'tape hiss as texture' },
+  { t: 40,  text: 'time dissolves' },
+  { t: 45,  text: 'signal and noise' },
+  { t: 50,  text: 'the loop returns' },
+  { t: 55,  text: '♪' },
+];
+
+// ── UI Update ──────────────────────────────────────────────────────────────
+function updateNowPlaying(title, pos, dur, paused, volume, speed, queueLen, queueIdx) {
+  // Sync state so other functions (updateQueue) see correct paused value
+  state.paused = paused;
+  state.title  = title;
+  document.getElementById('track-title').textContent = title;
+  document.getElementById('track-meta').textContent = paused
+    ? '⏸ paused' : (title !== 'nothing playing' ? '▶ playing' : '— idle —');
+
+  const pct = dur > 0 ? (pos / dur * 100) : 0;
+  document.getElementById('progress-fill').style.width = pct + '%';
+  document.getElementById('time-pos').textContent = fmtTime(pos);
+  document.getElementById('time-dur').textContent = fmtTime(dur);
+
+  document.getElementById('play-btn').textContent = paused ? '▶' : '⏸';
+
+  const vinyl = document.getElementById('vinyl');
+  if (!paused && title !== 'nothing playing') {
+    vinyl.classList.add('spinning');
+    vinyl.classList.remove('paused');
+  } else {
+    vinyl.classList.remove('spinning');
+    vinyl.classList.add('paused');
+  }
+
+  document.getElementById('vol-slider').value = volume;
+  document.getElementById('vol-val').textContent = Math.round(volume) + '%';
+
+  document.getElementById('stat-queue').textContent = queueLen;
+  document.getElementById('stat-speed').textContent = speed.toFixed(1) + 'x';
+  document.getElementById('stat-pos').textContent = fmtTime(pos);
+  document.getElementById('stat-pct').textContent = dur > 0 ? Math.round(pct) + '%' : '—';
+
+  // Status dot
+  const dot = document.getElementById('status-dot');
+  const statusLabel = document.getElementById('daemon-status');
+  if (title !== 'nothing playing') {
+    dot.style.background = paused ? 'var(--accent3)' : 'var(--accent)';
+    dot.style.animation = paused ? 'none' : 'pulse 2s ease-in-out infinite';
+    statusLabel.textContent = paused ? 'paused' : 'playing';
+  } else {
+    dot.style.background = 'var(--muted)';
+    dot.style.animation = 'none';
+    statusLabel.textContent = 'idle';
+  }
+}
+
+function updateQueue(queue, currentIdx) {
+  const el = document.getElementById('queue-list');
+  if (!queue.length) {
+    el.innerHTML = '<div style="color:var(--muted);font-size:12px;padding:20px 0;text-align:center;">queue empty — type a song below to play</div>';
+    return;
+  }
+  el.innerHTML = queue.map((item, i) => `
+    <div class="queue-item ${i === currentIdx ? 'active' : ''}" onclick="playQueueItem(${i})">
+      ${i === currentIdx ? `
+        <div class="playing-bars">
+          <div class="bar-line" style="${state.paused ? 'height:4px;' : ''}"></div>
+          <div class="bar-line" style="${state.paused ? 'height:8px;animation:none;' : ''}"></div>
+          <div class="bar-line" style="${state.paused ? 'height:6px;animation:none;' : ''}"></div>
+        </div>
+      ` : `<span class="queue-num">${i + 1}</span>`}
+      <span class="queue-item-title">${item.title}</span>
+      <span class="queue-duration">${item.dur}</span>
+    </div>
+  `).join('');
+
+  // Scroll active into view
+  const active = el.querySelector('.active');
+  if (active) active.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+
+function updateLyrics(lyrics, pos) {
+  const el = document.getElementById('lyrics-content');
+  if (!lyrics.length) return;
+
+  let cur = 0;
+  for (let i = 0; i < lyrics.length; i++) {
+    if (lyrics[i].t <= pos) cur = i;
+  }
+
+  el.innerHTML = lyrics.map((line, i) => {
+    const cls = i === cur ? 'active' : (i < cur ? 'past' : '');
+    return `<div class="lyric-line ${cls}" onclick="seekToLyric(${line.t})">${line.text}</div>`;
+  }).join('');
+
+  const activeLine = el.querySelector('.active');
+  if (activeLine) activeLine.scrollIntoView({ block: 'center', behavior: 'smooth' });
+}
+
+// ── Demo Simulation ────────────────────────────────────────────────────────
+let simPos = 0;
+let simDur = 151; // 2:31
+let simRunning = false;
+let simTitle = 'nothing playing';
+let simPaused = true;
+
+function startDemo() {
+  simTitle = DEMO_QUEUE[0].title;
+  simDur = parseDur(DEMO_QUEUE[0].dur);
+  simPos = 0;
+  simPaused = false;
+  simRunning = true;
+  state.queue = [...DEMO_QUEUE];
+  state.currentIdx = 0;
+  showToast('▶ ' + simTitle);
+}
+
+function parseDur(str) {
+  const [m, s] = str.split(':').map(Number);
+  return m * 60 + s;
+}
+
+setInterval(() => {
+  if (!simRunning) {
+    updateNowPlaying(simTitle, simPos, simDur, simPaused, state.volume, state.speed, state.queue.length, state.currentIdx);
+    updateQueue(state.queue, state.currentIdx);
+    return;
+  }
+  if (!simPaused) {
+    simPos += 0.5;
+    if (simPos >= simDur) {
+      // Auto-advance
+      const nextIdx = (state.currentIdx + 1) % state.queue.length;
+      if (nextIdx === 0 && !state.repeat) {
+        // End of queue, no repeat — stop
+        simPaused = true;
+        simPos = simDur;
+        showToast('⏹ end of queue');
+      } else {
+        state.currentIdx = nextIdx;
+        simTitle = state.queue[state.currentIdx].title;
+        simDur   = parseDur(state.queue[state.currentIdx].dur);
+        simPos   = 0;
+        showToast('⏭ ' + simTitle);
+      }
+    }
+  }
+  updateNowPlaying(simTitle, simPos, simDur, simPaused, state.volume, state.speed, state.queue.length, state.currentIdx);
+  updateQueue(state.queue, state.currentIdx);
+  updateLyrics(DEMO_LYRICS, simPos);
+}, 500);
+
+// ── Commands ───────────────────────────────────────────────────────────────
+function cmd(command) {
+  const parts = command.trim().split(/\s+/);
+  const action = parts[0];
+
+  switch (action) {
+    case 'pause':
+    case 'pp': {
+      if (!simRunning) { startDemo(); return; }
+      simPaused = !simPaused;
+      showToast(simPaused ? '⏸ paused' : '▶ resumed');
+      break;
+    }
+    case 'next':
+    case 'mn': {
+      if (!simRunning) { showToast('nothing playing'); return; }
+      state.currentIdx = (state.currentIdx + 1) % state.queue.length;
+      simTitle = state.queue[state.currentIdx].title;
+      simDur   = parseDur(state.queue[state.currentIdx].dur);
+      simPos   = 0; simPaused = false;
+      showToast('⏭ ' + simTitle);
+      break;
+    }
+    case 'prev':
+    case 'mb': {
+      if (!simRunning) { showToast('nothing playing'); return; }
+      state.currentIdx = (state.currentIdx - 1 + state.queue.length) % state.queue.length;
+      simTitle = state.queue[state.currentIdx].title;
+      simDur   = parseDur(state.queue[state.currentIdx].dur);
+      simPos   = 0; simPaused = false;
+      showToast('⏮ ' + simTitle);
+      break;
+    }
+    case 'seek': {
+      if (!simRunning) { showToast('nothing playing'); return; }
+      const seekArg = parts[1];
+      if (seekArg) {
+        if (seekArg.startsWith('+'))      simPos = Math.min(simDur, simPos + parseInt(seekArg.slice(1)));
+        else if (seekArg.startsWith('-')) simPos = Math.max(0,      simPos - parseInt(seekArg.slice(1)));
+        else                              simPos = Math.min(simDur, Math.max(0, parseInt(seekArg)));
+      }
+      showToast('⏩ ' + fmtTime(simPos));
+      break;
+    }
+    case 'vol':
+    case 'volume': {
+      const volArg = parts[1];
+      if (volArg !== undefined) {
+        let v;
+        if (volArg.startsWith('+'))      v = state.volume + parseInt(volArg.slice(1));
+        else if (volArg.startsWith('-')) v = state.volume - parseInt(volArg.slice(1));
+        else                             v = parseInt(volArg);
+        v = Math.max(0, Math.min(150, v));
+        state.volume = v;
+        document.getElementById('vol-slider').value = v;
+        document.getElementById('vol-val').textContent = v + '%';
+        showToast('🔊 volume: ' + v + '%');
+      } else {
+        showToast('🔊 volume: ' + state.volume + '%');
+      }
+      break;
+    }
+    case 'speed': {
+      const spArg = parseFloat(parts[1]);
+      if (!isNaN(spArg) && spArg > 0) {
+        state.speed = Math.max(0.25, Math.min(4, spArg));
+        showToast('⚡ speed: ' + state.speed.toFixed(2) + 'x');
+      } else {
+        showToast('⚡ speed: ' + state.speed.toFixed(2) + 'x');
+      }
+      break;
+    }
+    case 'stop': {
+      simRunning = false; simPaused = true; simPos = 0;
+      showToast('⏹ stopped');
+      break;
+    }
+    case 'start': {
+      if (!simRunning) startDemo();
+      simPaused = false;
+      showToast('▶ started');
+      break;
+    }
+    case 'shuffle': {
+      if (!state.queue.length) { showToast('queue empty'); return; }
+      const cur = state.queue[state.currentIdx];
+      const rest = state.queue.filter((_, i) => i !== state.currentIdx);
+      rest.sort(() => Math.random() - 0.5);
+      state.queue = [cur, ...rest];
+      state.currentIdx = 0;
+      showToast('🔀 queue shuffled');
+      break;
+    }
+    case 'repeat':
+    case 'rp': {
+      state.repeat = !state.repeat;
+      const badge = document.getElementById('repeat-badge');
+      if (badge) badge.style.display = state.repeat ? '' : 'none';
+      showToast(state.repeat ? '🔁 repeat on' : '🔁 repeat off');
+      break;
+    }
+    case 'clear': {
+      state.queue = []; simRunning = false;
+      simTitle = 'nothing playing'; simPaused = true; simPos = 0;
+      showToast('🗑 queue cleared');
+      break;
+    }
+    case 'like': {
+      if (simRunning && simTitle !== 'nothing playing') showToast('❤ liked: ' + simTitle);
+      else showToast('nothing playing');
+      break;
+    }
+    case 'unlike': {
+      if (simRunning) showToast('💔 unliked: ' + simTitle);
+      break;
+    }
+    case 'norm': {
+      showToast('⚖ toggled normalize');
+      break;
+    }
+    case 'now':
+    case 'status': {
+      showToast(simRunning ? (simPaused ? '⏸ ' : '▶ ') + simTitle : 'idle');
+      break;
+    }
+    case 'queue': {
+      showToast('📋 ' + state.queue.length + ' tracks in queue');
+      break;
+    }
+    case 'autodj': {
+      state.autoDj = !state.autoDj;
+      const djBadge = document.getElementById('autodj-badge');
+      if (djBadge) djBadge.style.display = state.autoDj ? '' : 'none';
+      showToast(state.autoDj ? '🤖 auto-dj on' : '🤖 auto-dj off');
+      break;
+    }
+    case 'history': { showToast('📜 history — use terminal for full view'); break; }
+    case 'doctor':  { showToast('🩺 doctor — run in terminal for full check'); break; }
+    case 'update':  { showToast('⬆ update — run in terminal'); break; }
+    case 'lyrics':  { showToast('🎤 lyrics — showing demo lyrics'); break; }
+    case 'art':     { showToast('🖼 art — requires terminal + chafa'); break; }
+    case 'bar':     { showToast('📊 bar — use terminal progress view'); break; }
+    default:        { showToast('→ m ' + command); break; }
+  }
+}
+
+function setVolume(val) {
+  state.volume = Math.max(0, Math.min(150, parseInt(val)));
+  document.getElementById('vol-slider').value = state.volume;
+  document.getElementById('vol-val').textContent = state.volume + '%';
+}
+
+function setEq(preset) {
+  state.eq = preset;
+  document.querySelectorAll('.eq-btn').forEach(b => b.classList.remove('active'));
+  const btn = document.getElementById('eq-' + preset);
+  if (btn) btn.classList.add('active');
+  showToast('🎚 eq: ' + preset);
+}
+
+function quickPlay(query) {
+  // Add a demo entry to the queue for the genre chip clicked
+  const durations = ['3:22','4:11','5:47','2:58','6:30','3:44'];
+  const newTrack = {
+    title: query.charAt(0).toUpperCase() + query.slice(1) + ' — ♪ live stream',
+    dur: durations[Math.floor(Math.random() * durations.length)]
+  };
+  if (!simRunning) {
+    state.queue = [newTrack];
+    state.currentIdx = 0;
+    simTitle = newTrack.title;
+    simDur   = parseDur(newTrack.dur);
+    simPos   = 0; simPaused = false; simRunning = true;
+  } else {
+    state.queue.push(newTrack);
+  }
+  showToast('🎵 queued: ' + query);
+}
+
+function playQueueItem(idx) {
+  if (!simRunning) return;
+  state.currentIdx = idx;
+  simTitle = state.queue[idx].title;
+  simDur = parseDur(state.queue[idx].dur);
+  simPos = 0;
+  simPaused = false;
+  showToast('▶ ' + simTitle);
+}
+
+function seekClick(event) {
+  if (!simRunning) return;
+  const rect = event.currentTarget.getBoundingClientRect();
+  const x = event.clientX - rect.left;
+  const pct = x / rect.width;
+  simPos = Math.round(pct * simDur);
+  showToast('⏩ ' + fmtTime(simPos));
+}
+
+function seekToLyric(t) {
+  simPos = t;
+  showToast('⏩ ' + fmtTime(t));
+}
+
+// ── Command history (up/down arrow in cmd bar) ─────────────────────────────
+const cmdHistory = [];
+let cmdHistoryIdx = 0;
+
+function handleCmd(e) {
+  if (e.key === 'Enter') {
+    const val = e.target.value.trim();
+    if (!val) return;
+    // Add to command history
+    cmdHistory.push(val);
+    cmdHistoryIdx = cmdHistory.length;
+    e.target.value = '';
+
+    const first = val.split(/\s+/)[0];
+
+    if (first === 'eq') {
+      const preset = val.split(/\s+/)[1];
+      if (preset) setEq(preset);
+      else showToast('eq presets: flat bass treble vocal loud');
+    } else {
+      // Everything else goes through cmd() — including vol, seek, pause, next, etc.
+      cmd(val);
+      // If not a known command, treat as search query
+      const knownCmds = new Set(['pause','pp','next','mn','prev','mb','stop','start','shuffle',
+        'repeat','rp','clear','now','bar','lyrics','art','status','like','unlike','history',
+        'queue','norm','update','doctor','vol','volume','seek','speed','autodj',
+        'repeat-one','ro','like','unlike','likes','love','similar','replay','rl',
+        'sleep','export','reload-config','index','local','cast','bookmark','bookmarks',
+        'bookmark-load','bl','autodj','eq','dl','dl-list','import','txt','txts',
+        'txtnext','tn','txtprev','tp','txtnow','txtpick','tj','txtedit','te',
+        'txt-export','save','load','playlists','pls','pldel','hp','sp','devices',
+        'queue-restore','qr','qmove','qrm','log','log-clear','cache-clear',
+        'cache-prune','cache-stats','scrub','slider','add-next','help']);
+      if (!knownCmds.has(first)) {
+        // It was treated as a search by cmd() default, start demo if needed
+        if (!simRunning) startDemo();
+      }
+    }
+  }
+  // Up/Down arrow for command history navigation
+  if (e.key === 'ArrowUp') {
+    if (cmdHistoryIdx > 0) {
+      cmdHistoryIdx--;
+      e.target.value = cmdHistory[cmdHistoryIdx] || '';
+    }
+    e.preventDefault();
+  }
+  if (e.key === 'ArrowDown') {
+    if (cmdHistoryIdx < cmdHistory.length - 1) {
+      cmdHistoryIdx++;
+      e.target.value = cmdHistory[cmdHistoryIdx] || '';
+    } else {
+      cmdHistoryIdx = cmdHistory.length;
+      e.target.value = '';
+    }
+    e.preventDefault();
+  }
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+function fmtTime(s) {
+  s = Math.floor(s);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+let toastTimer;
+function showToast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 2000);
+}
+
+// ── Keyboard shortcuts ─────────────────────────────────────────────────────
+document.addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'INPUT') return;
+  switch (e.key) {
+    case ' ': e.preventDefault(); cmd('pause'); break;
+    case 'ArrowRight': cmd('seek +10'); break;
+    case 'ArrowLeft':  cmd('seek -10'); break;
+    case 'ArrowUp':    state.volume = Math.min(150, state.volume + 5); document.getElementById('vol-slider').value = state.volume; setVolume(state.volume); break;
+    case 'ArrowDown':  state.volume = Math.max(0, state.volume - 5); document.getElementById('vol-slider').value = state.volume; setVolume(state.volume); break;
+    case 'n': cmd('next'); break;
+    case 'b': cmd('prev'); break;
+    case '/': e.preventDefault(); document.getElementById('cmd-input').focus(); break;
+    case 'Escape': document.getElementById('cmd-input').blur(); break;
+  }
+});
+
+// ── Init ───────────────────────────────────────────────────────────────────
+// Auto-start demo with the queue visible
+state.queue = [...DEMO_QUEUE];
+updateQueue(state.queue, -1);
+updateNowPlaying('nothing playing', 0, 0, true, 80, 1.0, 0, -1);
+
+setTimeout(() => {
+  showToast('press SPACE to play · / to search · ↑↓ history');
+}, 800);
+</script>
+</body>
+</html>
