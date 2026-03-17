@@ -37,6 +37,7 @@
 # ============================================================
 
 set -u
+set +v +x  # Disable verbose/debug output
 
 # ── paths ────────────────────────────────────────────────────
 MUSIC_ROOT="${MUSIC_ROOT:-$HOME/music_system}"
@@ -2585,6 +2586,7 @@ do_txt() {
   echo 0 > "$sem_file"
 
   (
+    set +v +x  # Disable verbose/debug output in subshell
     local socat="$_bg_socat" socket="$_bg_socket" jq="$_bg_jq"
     local ytdlp="$_bg_ytdlp" cache_dir="$_bg_cache_dir" cache_ttl="$_bg_cache_ttl"
     local my_gen="$_bg_gen" gen_file="$_bg_gen_file"
@@ -2662,12 +2664,14 @@ do_txt() {
     # Spawn workers: each writes to tmpdir/$i; semaphore limits concurrency
     local i=$(( start_idx + 2 ))
     while [ $i -le ${#TXT_LINES[@]} ]; do
-      local cur_gen; cur_gen=$(cat "$gen_file" 2>/dev/null || echo 0)
+      local cur_gen
+      cur_gen=$(cat "$gen_file" 2>/dev/null || echo 0)
       [ "$cur_gen" = "$my_gen" ] || { rm -rf "$tmpdir"; exit 0; }
 
       # Semaphore: wait until running < 4
       while true; do
-        local running; running=$(cat "$sem" 2>/dev/null || echo 0)
+        local running
+        running=$(cat "$sem" 2>/dev/null || echo 0)
         [[ "$running" -lt 4 ]] && break
         sleep 0.05
       done
@@ -2675,13 +2679,16 @@ do_txt() {
 
       local query="${TXT_LINES[$i]}"
       (
+        set +v +x  # Disable verbose/debug output in worker subshell
         local cur; cur=$(cat "$gen_file" 2>/dev/null || echo 0)
         [ "$cur" = "$my_gen" ] || { echo $(( $(cat "$sem" 2>/dev/null) - 1 )) > "$sem"; exit 0; }
         local result; result=$(_bg_search_one "$query")
-        local cnt; cnt=$(cat "$sem" 2>/dev/null || echo 0)
+        local cnt
+        cnt=$(cat "$sem" 2>/dev/null || echo 0)
         echo $(( cnt - 1 )) > "$sem"
         [ -z "$result" ] && exit 0
-        local url; url=$(echo "$result" | head -1 | awk -F ' \| ' '{print $NF}')
+        local url
+        url=$(echo "$result" | head -1 | awk -F ' \| ' '{print $NF}')
         [ -z "$url" ] && exit 0
         echo "$url" > "$tmpdir/$i"
       ) &
@@ -2696,16 +2703,18 @@ do_txt() {
     while [ $j -le ${#TXT_LINES[@]} ]; do
       [ "$(cat "$gen_file" 2>/dev/null || echo 0)" = "$my_gen" ] || break
       if [ -f "$tmpdir/$j" ]; then
-        local url; url=$(cat "$tmpdir/$j" 2>/dev/null)
+        local url
+        url=$(cat "$tmpdir/$j" 2>/dev/null)
         [ -n "$url" ] && {
-          local json; json=$("$jq" -cn --arg url "$url" '{"command":["loadfile",$url,"append"]}')
+          local json
+          json=$("$jq" -cn --arg url "$url" '{"command":["loadfile",$url,"append"]}')
           echo "$json" | "$socat" - "$socket" >/dev/null 2>&1
         }
       fi
       j=$(( j + 1 ))
     done
     rm -rf "$tmpdir"
-  ) &
+  ) >/dev/null 2>&1 &
 
   local bg_pid=$!
   # v5-C: write PID file atomically BEFORE disown (tempfile swap)
